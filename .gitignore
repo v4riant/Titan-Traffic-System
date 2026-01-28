@@ -1,0 +1,12 @@
+# Ignore the local database
+*.db
+*.sqlite3
+
+# Ignore python cache files
+__pycache__/
+*.pyc
+
+# Ignore virtual environments
+venv/
+.env
+.DS_Store
