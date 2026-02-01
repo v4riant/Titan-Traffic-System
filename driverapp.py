@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import folium
@@ -9,6 +8,8 @@ import time
 import random
 import requests
 import html
+import sys
+import os
 
 try:
     from geopy.distance import geodesic
@@ -42,215 +43,212 @@ st.set_page_config(
 )
 
 # SHARED DATABASE (MUST MATCH SERVER — same path as App.py)
-import sys
-import os
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
-from shared_utils import fetch_route_alternatives_4, distance_km, hash_password, verify_password
+from shared_utils import fetch_route_alternatives_4, distance_km, hash_password, verify_password, calculate_co2_savings
+try:
+    from shared_utils import HOSPITALS, MISSION_EXPIRY_SEC
+except ImportError:
+    MISSION_EXPIRY_SEC = 1800
+    HOSPITALS = {
+        "Aster Medcity (Cheranallur)": [10.0575, 76.2652], "Amrita AIMS (Edappally)": [10.0326, 76.2997],
+        "Rajagiri Hospital (Aluva)": [10.0536, 76.3557], "Medical Trust Hospital (MG Road)": [9.9655, 76.2933],
+        "Lisie Hospital (Kaloor)": [9.9904, 76.2872], "General Hospital (Ernakulam)": [9.9734, 76.2818],
+        "VPS Lakeshore (Nettoor)": [9.9337, 76.3074], "Renai Medicity (Palarivattom)": [10.0076, 76.3053],
+        "Sunrise Hospital (Kakkanad)": [10.0069, 76.3308], "Apollo Adlux (Angamaly)": [10.1800, 76.3700],
+        "Lourdes Hospital (Pachalam)": [9.9980, 76.2920], "PVS Memorial (Kaloor)": [9.9940, 76.2900],
+        "Specialist Hospital (North)": [9.9920, 76.2880], "EMC (Palarivattom)": [10.0020, 76.3150],
+        "Kinder Hospital (Pathadipalam)": [10.0300, 76.3100], "Gautham Hospital (Panayappilly)": [9.9480, 76.2600],
+        "Sudheendra Medical Mission": [9.9700, 76.2850], "Krishna Hospital (MG Road)": [9.9680, 76.2900],
+        "Cochin Hospital": [9.9600, 76.2950], "Lakshmi Hospital": [9.9620, 76.2920],
+        "Welcare Hospital (Vyttila)": [9.9698, 76.3211], "Vijaya Hospital": [9.9550, 76.3000],
+        "Sree Sudheendra": [9.9750, 76.2800], "City Hospital": [9.9800, 76.2850],
+        "Silverline Hospital": [9.9750, 76.3200], "Kusumagiri Mental Health": [10.0200, 76.3400],
+        "MAJ Hospital (Edappally)": [10.0250, 76.3100], "Carmel Hospital (Aluva)": [10.1100, 76.3500],
+        "Najath Hospital (Aluva)": [10.1050, 76.3550], "Don Bosco Hospital": [10.0000, 76.2700],
+        "Mattancherry Hospital": [9.9500, 76.2500], "Fort Kochi Taluk Hospital": [9.9650, 76.2400],
+        "Samaritan Hospital": [10.1900, 76.3800], "Mom Hospital": [10.0150, 76.3100]
+    }
 
 DB_FILE = os.path.join(_APP_DIR, "titan_v52.db")
-TOMTOM_API_KEY = "EH7SOW12eDLJn2bR6UvfEbnpNvnrx8o4"
 
-# FULL HOSPITAL LIST
-HOSPITALS = {
-    "Aster Medcity (Cheranallur)": [10.0575, 76.2652], "Amrita AIMS (Edappally)": [10.0326, 76.2997],
-    "Rajagiri Hospital (Aluva)": [10.0536, 76.3557], "Medical Trust Hospital (MG Road)": [9.9655, 76.2933],
-    "Lisie Hospital (Kaloor)": [9.9904, 76.2872], "General Hospital (Ernakulam)": [9.9734, 76.2818],
-    "VPS Lakeshore (Nettoor)": [9.9337, 76.3074], "Renai Medicity (Palarivattom)": [10.0076, 76.3053],
-    "Sunrise Hospital (Kakkanad)": [10.0069, 76.3308], "Apollo Adlux (Angamaly)": [10.1800, 76.3700],
-    "Lourdes Hospital (Pachalam)": [9.9980, 76.2920], "PVS Memorial (Kaloor)": [9.9940, 76.2900],
-    "Specialist Hospital (North)": [9.9920, 76.2880], "EMC (Palarivattom)": [10.0020, 76.3150],
-    "Kinder Hospital (Pathadipalam)": [10.0300, 76.3100], "Gautham Hospital (Panayappilly)": [9.9480, 76.2600],
-    "Sudheendra Medical Mission": [9.9700, 76.2850], "Krishna Hospital (MG Road)": [9.9680, 76.2900],
-    "Cochin Hospital": [9.9600, 76.2950], "Lakshmi Hospital": [9.9620, 76.2920],
-    "Welcare Hospital (Vyttila)": [9.9698, 76.3211], "Vijaya Hospital": [9.9550, 76.3000],
-    "Sree Sudheendra": [9.9750, 76.2800], "City Hospital": [9.9800, 76.2850],
-    "Silverline Hospital": [9.9750, 76.3200], "Kusumagiri Mental Health": [10.0200, 76.3400],
-    "MAJ Hospital (Edappally)": [10.0250, 76.3100], "Carmel Hospital (Aluva)": [10.1100, 76.3500],
-    "Najath Hospital (Aluva)": [10.1050, 76.3550], "Don Bosco Hospital": [10.0000, 76.2700],
-    "Mattancherry Hospital": [9.9500, 76.2500], "Fort Kochi Taluk Hospital": [9.9650, 76.2400],
-    "Samaritan Hospital": [10.1900, 76.3800], "Mom Hospital": [10.0150, 76.3100]
-}
+# HOSPITALS from shared_utils (single source of truth)
 
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800&family=Rajdhani:wght@300;400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Exo+2:wght@400;500;600;700&display=swap');
     
     .stApp { 
-        background: linear-gradient(165deg, #050608 0%, #0a0d12 40%, #080b0f 80%, #060809 100%) !important;
-        color: #e6edf3 !important;
+        background: #050508 !important;
+        background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(0,245,255,0.08), transparent),
+                          radial-gradient(ellipse 60% 40% at 100% 50%, rgba(255,0,255,0.04), transparent),
+                          radial-gradient(ellipse 60% 40% at 0% 80%, rgba(0,245,255,0.03), transparent) !important;
+        color: #e8e8f0 !important;
     }
     
     #MainMenu, footer, header { visibility: hidden; }
     .stDeployButton { display: none; }
     
-    .block-container { padding-top: 1.5rem !important; padding-bottom: 2rem !important; max-width: 680px !important; }
+    .block-container { padding-top: 1.2rem !important; padding-bottom: 2rem !important; max-width: 680px !important; margin: 0 auto !important; }
+    .stTabs [data-baseweb="tab-list"] { 
+        gap: 6px !important; background: rgba(10,10,18,0.8) !important; padding: 6px !important; 
+        border-radius: 16px !important; border: 1px solid rgba(0,245,255,0.2) !important;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.03) !important;
+    }
+    .stTabs [data-baseweb="tab"] { padding: 10px 16px !important; font-size: 12px !important; font-family: 'Exo 2' !important; font-weight: 600 !important; border-radius: 12px !important; }
+    .stTabs [aria-selected="true"] { 
+        background: linear-gradient(135deg, rgba(0,245,255,0.25), rgba(255,0,255,0.15)) !important; 
+        color: #00f5ff !important; border: 1px solid rgba(0,245,255,0.4) !important;
+        box-shadow: 0 0 20px rgba(0,245,255,0.2), inset 0 1px 0 rgba(255,255,255,0.1) !important;
+    }
     
-    /* HEADER */
+    /* FLOATING HEADER - Cyberpunk */
     .mobile-header {
-        background: linear-gradient(145deg, rgba(20,24,34,0.98), rgba(12,16,24,0.99));
-        backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
-        padding: 20px 24px; border-radius: 18px;
+        background: rgba(8,8,16,0.85);
+        backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+        padding: 20px 24px;
         display: flex; justify-content: space-between; align-items: center;
-        margin-bottom: 24px;
-        border: 1px solid rgba(255,255,255,0.08);
-        box-shadow: 0 8px 32px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.04);
+        margin-bottom: 20px;
+        border: 1px solid rgba(0,245,255,0.3);
+        border-radius: 16px;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 40px rgba(0,245,255,0.08), inset 0 1px 0 rgba(255,255,255,0.05);
     }
     
-    /* SPEEDOMETER */
+    /* FLOATING SPEEDOMETER */
     .speed-circle {
-        width: 210px; height: 210px; border-radius: 50%;
+        width: 200px; height: 200px; border-radius: 50%;
         margin: 0 auto; display: flex; flex-direction: column; justify-content: center; align-items: center;
-        background: radial-gradient(circle at 30% 30%, rgba(30,36,48,0.9), rgba(6,8,12,0.98));
-        border: 2px solid rgba(255,255,255,0.06);
-        box-shadow: inset 0 0 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(6,182,212,0.2), 0 20px 40px rgba(0,0,0,0.4);
+        background: rgba(8,8,16,0.6);
+        border: 2px solid rgba(0,245,255,0.5);
+        box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 60px rgba(0,245,255,0.15), inset 0 0 60px rgba(0,245,255,0.03);
+        border-radius: 50%;
     }
-    .speed-val { font-family: 'Orbitron'; font-size: 58px; font-weight: 700; color: #fff; line-height: 1; letter-spacing: -2px; text-shadow: 0 0 30px rgba(6,182,212,0.3); }
-    .speed-unit { font-family: 'Rajdhani'; font-size: 11px; color: #6b7280; letter-spacing: 5px; margin-top: 6px; }
+    .speed-val { font-family: 'Orbitron'; font-size: 52px; font-weight: 700; color: #00f5ff; line-height: 1; letter-spacing: -2px; text-shadow: 0 0 30px rgba(0,245,255,0.6); }
+    .speed-unit { font-family: 'JetBrains Mono'; font-size: 10px; color: rgba(0,245,255,0.6); letter-spacing: 4px; margin-top: 4px; }
     
-    /* METRIC CARDS */
+    /* FLOATING WIDGET CARDS */
     .widget-box { 
-        background: linear-gradient(145deg, rgba(24,28,38,0.95), rgba(14,18,26,0.98));
-        border-radius: 16px; padding: 20px;
-        text-align: center; border: 1px solid rgba(255,255,255,0.06);
-        box-shadow: 0 4px 20px rgba(0,0,0,0.4);
-        transition: all 0.3s cubic-bezier(0.4,0,0.2,1);
+        background: rgba(8,8,16,0.7);
+        backdrop-filter: blur(12px);
+        border-radius: 16px;
+        padding: 18px;
+        text-align: center;
+        border: 1px solid rgba(0,245,255,0.2);
+        box-shadow: 0 8px 24px rgba(0,0,0,0.4), 0 0 20px rgba(0,245,255,0.05), inset 0 1px 0 rgba(255,255,255,0.03);
+        transition: all 0.3s ease;
     }
     .widget-box:hover { 
-        border-color: rgba(6,182,212,0.25); 
-        box-shadow: 0 8px 28px rgba(6,182,212,0.15);
-        transform: translateY(-2px);
+        transform: translateY(-4px); 
+        border-color: rgba(0,245,255,0.4); 
+        box-shadow: 0 12px 32px rgba(0,0,0,0.5), 0 0 40px rgba(0,245,255,0.15); 
     }
-    .w-title { color: #6b7280; font-size: 10px; letter-spacing: 2px; text-transform: uppercase; font-family: 'Inter'; font-weight: 600; }
-    .w-val { color: #e6edf3; font-size: 24px; font-family: 'Orbitron'; font-weight: 600; margin-top: 6px; }
+    .w-title { color: rgba(0,245,255,0.7); font-size: 9px; letter-spacing: 3px; text-transform: uppercase; font-family: 'JetBrains Mono'; font-weight: 600; }
+    .w-val { color: #00f5ff; font-size: 22px; font-family: 'Orbitron'; font-weight: 700; margin-top: 6px; text-shadow: 0 0 20px rgba(0,245,255,0.3); }
     
-    /* SEXY BUTTONS - Base */
+    /* FLOATING BUTTONS - Cyberpunk glow */
     .stButton > button { 
         width: 100% !important; min-height: 52px !important; border-radius: 14px !important;
-        font-family: 'Inter' !important; font-size: 14px !important; font-weight: 600 !important;
-        background: linear-gradient(145deg, rgba(35,40,52,0.98), rgba(22,26,36,0.98)) !important;
-        color: #e6edf3 !important; border: 1px solid rgba(255,255,255,0.1) !important;
-        transition: all 0.3s cubic-bezier(0.4,0,0.2,1) !important;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.05) !important;
+        font-family: 'Exo 2' !important; font-size: 14px !important; font-weight: 600 !important;
+        background: rgba(12,12,24,0.9) !important;
+        color: #e8e8f0 !important; border: 1px solid rgba(0,245,255,0.25) !important;
+        transition: all 0.3s ease !important;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.03) !important;
     }
     .stButton > button:hover { 
-        background: linear-gradient(145deg, rgba(6,182,212,0.2), rgba(6,182,212,0.08)) !important;
-        border-color: rgba(6,182,212,0.5) !important;
-        box-shadow: 0 8px 24px rgba(6,182,212,0.2) !important;
-        transform: translateY(-2px) scale(1.01);
+        background: linear-gradient(135deg, rgba(0,245,255,0.2), rgba(255,0,255,0.1)) !important;
+        color: #fff !important; border-color: rgba(0,245,255,0.5) !important;
+        box-shadow: 0 8px 28px rgba(0,0,0,0.4), 0 0 30px rgba(0,245,255,0.2) !important;
+        transform: translateY(-2px) !important;
     }
-    .stButton > button:active { transform: translateY(0) scale(0.99); }
+    .stButton > button:active { transform: translateY(0) scale(0.98) !important; }
     
-    /* Accept / Primary */
-    .accept-btn button { 
-        background: linear-gradient(135deg, #10b981 0%, #059669 50%, #047857 100%) !important; 
-        color: #fff !important; border: none !important;
-        box-shadow: 0 4px 20px rgba(16,185,129,0.4), inset 0 1px 0 rgba(255,255,255,0.2) !important;
-    }
-    .accept-btn button:hover { 
-        background: linear-gradient(135deg, #34d399 0%, #10b981 50%, #059669 100%) !important;
-        box-shadow: 0 8px 32px rgba(16,185,129,0.5) !important;
-        transform: translateY(-2px);
-    }
-    
-    /* Auto / Secondary */
-    .auto-btn button { 
-        background: linear-gradient(135deg, #f59e0b 0%, #d97706 50%, #b45309 100%) !important; 
-        color: #fff !important; border: none !important;
-        box-shadow: 0 4px 20px rgba(245,158,11,0.35), inset 0 1px 0 rgba(255,255,255,0.2) !important;
-    }
-    .auto-btn button:hover { 
-        background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 50%, #d97706 100%) !important;
-        box-shadow: 0 8px 28px rgba(245,158,11,0.45) !important;
-        transform: translateY(-2px);
-    }
-    
-    /* End / Danger */
-    .end-btn button { 
-        background: linear-gradient(135deg, #ef4444 0%, #dc2626 50%, #b91c1c 100%) !important; 
-        color: #fff !important; border: none !important;
-        box-shadow: 0 4px 20px rgba(239,68,68,0.35), inset 0 1px 0 rgba(255,255,255,0.15) !important;
-    }
-    .end-btn button:hover { 
-        background: linear-gradient(135deg, #f87171 0%, #ef4444 50%, #dc2626 100%) !important;
-        box-shadow: 0 8px 28px rgba(239,68,68,0.5) !important;
-        transform: translateY(-2px);
-    }
-    
-    /* CARDS */
+    /* ROUTE CARDS - Floating */
     .route-card {
-        background: linear-gradient(145deg, rgba(24,28,38,0.9), rgba(14,18,26,0.95));
-        border-left: 4px solid #4b5563;
-        padding: 18px; margin-bottom: 14px; border-radius: 14px;
-        border: 1px solid rgba(255,255,255,0.05);
-        box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+        background: rgba(8,8,16,0.7);
+        backdrop-filter: blur(12px);
+        border-left: 4px solid rgba(0,245,255,0.3);
+        padding: 18px; margin-bottom: 14px; border-radius: 16px;
+        border: 1px solid rgba(0,245,255,0.15);
+        box-shadow: 0 8px 24px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.02);
+        transition: all 0.3s ease;
     }
+    .route-card:hover { transform: translateY(-2px); box-shadow: 0 12px 32px rgba(0,0,0,0.5), 0 0 25px rgba(0,245,255,0.08); }
     .route-card-best {
-        background: linear-gradient(145deg, rgba(6,182,212,0.12), rgba(6,182,212,0.03));
-        border-left: 4px solid #06b6d4;
-        border-color: rgba(6,182,212,0.4);
-        box-shadow: 0 4px 24px rgba(6,182,212,0.15);
+        border-left: 4px solid #00f5ff;
+        border-color: rgba(0,245,255,0.4);
+        box-shadow: 0 8px 28px rgba(0,0,0,0.4), 0 0 30px rgba(0,245,255,0.12);
     }
     
-    /* MISSION ALERT */
+    /* MISSION ALERT - Floating pulse */
     .mission-alert {
-        background: linear-gradient(145deg, rgba(220,38,38,0.12), rgba(220,38,38,0.04));
-        border: 1px solid rgba(220,38,38,0.4);
-        border-radius: 18px; padding: 28px; margin: 24px 0;
-        box-shadow: 0 8px 32px rgba(220,38,38,0.2), inset 0 1px 0 rgba(255,255,255,0.05);
+        background: rgba(8,8,16,0.85);
+        backdrop-filter: blur(20px);
+        border: 1px solid rgba(255,0,255,0.4);
+        border-radius: 20px;
+        padding: 28px 24px;
+        margin: 24px 0;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 50px rgba(255,0,255,0.15), inset 0 1px 0 rgba(255,255,255,0.05);
+        animation: cyber-pulse 2.5s ease-in-out infinite;
     }
-    /* Accept button (first button after mission-alert) gets green styling */
-    .mission-alert ~ * .stButton > button:first-of-type,
-    .block-container > div:has(.mission-alert) + div .stButton > button:first-of-type {
-        background: linear-gradient(135deg, #10b981 0%, #059669 50%, #047857 100%) !important;
-        color: #fff !important; border: none !important;
-        box-shadow: 0 4px 20px rgba(16,185,129,0.4), inset 0 1px 0 rgba(255,255,255,0.2) !important;
+    @keyframes cyber-pulse { 
+        0%, 100% { box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 50px rgba(255,0,255,0.15), inset 0 1px 0 rgba(255,255,255,0.05); } 
+        50% { box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 70px rgba(255,0,255,0.25), inset 0 1px 0 rgba(255,255,255,0.08); } 
     }
-    .mission-alert ~ * .stButton > button:first-of-type:hover,
-    .block-container > div:has(.mission-alert) + div .stButton > button:first-of-type:hover {
-        background: linear-gradient(135deg, #34d399 0%, #10b981 50%, #059669 100%) !important;
-        box-shadow: 0 8px 32px rgba(16,185,129,0.5) !important;
+    div.block-container > div:has(.mission-alert) + div [data-testid="column"] { display: flex !important; align-items: stretch !important; gap: 12px !important; }
+    div.block-container > div:has(.mission-alert) + div [data-testid="column"] .stButton { flex: 1; min-width: 0; width: 100%; }
+    div.block-container > div:has(.mission-alert) + div [data-testid="column"] .stButton > button {
+        width: 100% !important; min-height: 56px !important; font-size: 14px !important; font-weight: 700 !important;
+        border-radius: 14px !important; font-family: 'Exo 2' !important;
     }
-    
-    /* TABS */
-    .stTabs [data-baseweb="tab-list"] { 
-        background: rgba(18,22,30,0.9) !important; 
-        border-radius: 16px !important; 
-        padding: 8px !important; 
-        gap: 6px !important;
-        border: 1px solid rgba(255,255,255,0.06) !important;
+    div.block-container > div:has(.mission-alert) + div [data-testid="column"]:first-child .stButton > button {
+        background: linear-gradient(135deg, rgba(0,255,136,0.3), rgba(0,245,255,0.2)) !important;
+        color: #00ff88 !important; border: 1px solid rgba(0,255,136,0.5) !important;
+        box-shadow: 0 0 25px rgba(0,255,136,0.2) !important;
     }
-    .stTabs [data-baseweb="tab"] { 
-        border-radius: 12px !important; 
-        font-family: 'Inter' !important; 
-        font-weight: 500 !important;
-        padding: 10px 16px !important;
+    div.block-container > div:has(.mission-alert) + div [data-testid="column"]:first-child .stButton > button:hover {
+        background: linear-gradient(135deg, rgba(0,255,136,0.4), rgba(0,245,255,0.3)) !important;
+        box-shadow: 0 0 40px rgba(0,255,136,0.35) !important;
+        transform: translateY(-3px) !important;
     }
-    .stTabs [aria-selected="true"] { 
-        background: linear-gradient(135deg, rgba(6,182,212,0.25), rgba(6,182,212,0.1)) !important;
-        border: 1px solid rgba(6,182,212,0.3) !important;
+    div.block-container > div:has(.mission-alert) + div [data-testid="column"]:nth-child(2) .stButton > button {
+        background: transparent !important; color: #ff00ff !important; border: 1px solid rgba(255,0,255,0.5) !important;
+    }
+    div.block-container > div:has(.mission-alert) + div [data-testid="column"]:nth-child(2) .stButton > button:hover {
+        background: rgba(255,0,255,0.15) !important; box-shadow: 0 0 30px rgba(255,0,255,0.25) !important;
+        transform: translateY(-3px) !important;
     }
     
     /* INPUT FIELDS */
     .stTextInput input, .stTextArea textarea { 
-        background: rgba(18,22,30,0.95) !important; 
-        border-radius: 12px !important; 
-        border: 1px solid rgba(255,255,255,0.08) !important;
-        padding: 12px 16px !important;
+        background: rgba(8,8,16,0.8) !important; border-radius: 12px !important;
+        border: 1px solid rgba(0,245,255,0.2) !important; padding: 12px 16px !important;
+        font-family: 'Exo 2' !important;
     }
-    .stTextInput input:focus, .stTextArea textarea:focus { border-color: rgba(6,182,212,0.5) !important; box-shadow: 0 0 0 3px rgba(6,182,212,0.15) !important; }
+    .stTextInput input:focus, .stTextArea textarea:focus { 
+        border-color: rgba(0,245,255,0.5) !important; 
+        box-shadow: 0 0 0 2px rgba(0,245,255,0.15), 0 0 20px rgba(0,245,255,0.1) !important; 
+    }
     
     /* FORM SUBMIT */
     [data-testid="stFormSubmitButton"] button { 
-        background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%) !important;
-        color: #fff !important; font-weight: 700 !important;
-        box-shadow: 0 4px 20px rgba(6,182,212,0.4) !important;
+        background: linear-gradient(135deg, rgba(0,245,255,0.3), rgba(255,0,255,0.2)) !important;
+        color: #00f5ff !important; font-weight: 700 !important;
+        border: 1px solid rgba(0,245,255,0.4) !important; border-radius: 14px !important;
+        box-shadow: 0 0 25px rgba(0,245,255,0.2) !important;
     }
-    [data-testid="stFormSubmitButton"] button:hover { box-shadow: 0 8px 28px rgba(6,182,212,0.5) !important; }
+    [data-testid="stFormSubmitButton"] button:hover { 
+        box-shadow: 0 0 40px rgba(0,245,255,0.3) !important; 
+        transform: translateY(-2px) !important;
+    }
     
-    /* ACTION BAR PILLS */
-    .action-pill { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 999px; font-weight: 600; font-size: 13px; transition: all 0.2s; }
+    /* FLOATING CARD - reusable */
+    .float-card { 
+        background: rgba(8,8,16,0.7); backdrop-filter: blur(12px);
+        border: 1px solid rgba(0,245,255,0.2); border-radius: 16px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.4), 0 0 20px rgba(0,245,255,0.05), inset 0 1px 0 rgba(255,255,255,0.03);
+        padding: 20px; margin-bottom: 16px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -283,6 +281,15 @@ if 'last_poll_mission_id' not in st.session_state: st.session_state.last_poll_mi
 if 'pending_end_trip' not in st.session_state: st.session_state.pending_end_trip = False
 if 'pending_decline_mid' not in st.session_state: st.session_state.pending_decline_mid = None
 if 'favourite_hospitals' not in st.session_state: st.session_state.favourite_hospitals = []
+if 'pending_mission_sound' not in st.session_state: st.session_state.pending_mission_sound = False
+if 'pending_message_sound' not in st.session_state: st.session_state.pending_message_sound = False
+if 'last_seen_hq_message_id' not in st.session_state: st.session_state.last_seen_hq_message_id = 0
+if 'sounds_enabled' not in st.session_state: st.session_state.sounds_enabled = True  # Default ON - alert driver when mission/HQ message arrives
+if 'pending_sound_url' not in st.session_state: st.session_state.pending_sound_url = None
+if 'pending_sound_ts' not in st.session_state: st.session_state.pending_sound_ts = 0
+# Notification sound URLs (short, attention-grabbing)
+SOUND_MISSION = "https://assets.mixkit.co/active_storage/sfx/2869-ping-high-15.mp3"
+SOUND_ALERT = "https://assets.mixkit.co/active_storage/sfx/2568-simple-notification-2568.mp3"
 
 def init_db_extensions():
     try:
@@ -365,9 +372,18 @@ def init_db_extensions():
                 details TEXT
             )
         ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS mission_declines (
+                mission_id TEXT,
+                driver_id TEXT,
+                declined_at DATETIME,
+                reason TEXT,
+                PRIMARY KEY (mission_id, driver_id)
+            )
+        ''')
         c.execute(
             "INSERT OR IGNORE INTO driver_accounts (driver_id, username, password, full_name, created_at) VALUES (?, ?, ?, ?, ?)",
-            ("UNIT-07", "UNIT-07", hash_password("TITAN-DRIVER"), "Demo Driver", datetime.datetime.now()),
+            ("UNIT-07", "UNIT-07", hash_password("TITAN-DRIVER"), "Unit 7", datetime.datetime.now()),
         )
         conn.commit()
         conn.close()
@@ -479,13 +495,13 @@ def driver_signup(username, password, full_name, phone="", vehicle_id="", base_h
 
 def driver_login_screen():
     st.markdown("""
-    <div style="text-align:center; padding:56px 24px 40px;">
-        <div style="width:96px; height:96px; margin:0 auto 28px; background:linear-gradient(145deg,rgba(24,28,38,0.95),rgba(14,18,26,0.98)); border-radius:24px; display:flex; align-items:center; justify-content:center; border:1px solid rgba(255,255,255,0.1); box-shadow:0 12px 40px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.08);">
+    <div style="text-align:center; padding:48px 24px 40px;">
+        <div style="width:96px; height:96px; margin:0 auto 28px; background:rgba(8,8,16,0.8); border-radius:24px; display:flex; align-items:center; justify-content:center; border:1px solid rgba(0,245,255,0.4); box-shadow:0 12px 40px rgba(0,0,0,0.5), 0 0 50px rgba(0,245,255,0.15), inset 0 1px 0 rgba(255,255,255,0.05);">
             <span style="font-size:44px;">🚑</span>
         </div>
-        <div style="font-family:'Orbitron'; font-size:30px; font-weight:700; color:#e6edf3; letter-spacing:4px;">TITAN DRIVER</div>
-        <div style="color:#6b7280; font-size:13px; letter-spacing:4px; margin-top:10px; font-family:'Inter';">FLEET OPERATIONS PLATFORM</div>
-        <div style="height:2px; background:linear-gradient(90deg,transparent,rgba(6,182,212,0.5),transparent); margin:32px auto; max-width:200px; border-radius:1px;"></div>
+        <div style="font-family:'Orbitron', sans-serif; font-size:38px; font-weight:700; color:#00f5ff; letter-spacing:10px; text-shadow:0 0 30px rgba(0,245,255,0.5);">TITAN DRIVER</div>
+        <div style="color:rgba(255,0,255,0.8); font-size:11px; letter-spacing:8px; margin-top:10px; font-family:'JetBrains Mono';">FLEET OPERATIONS</div>
+        <div style="height:2px; background:linear-gradient(90deg, transparent, #00f5ff, #ff00ff, transparent); margin:32px auto; max-width:180px; border-radius:2px; opacity:0.8;"></div>
     </div>
     """, unsafe_allow_html=True)
     
@@ -493,8 +509,9 @@ def driver_login_screen():
     
     with auth_tab1:
         st.markdown("""
-        <div style="background:linear-gradient(145deg,rgba(20,24,34,0.98),rgba(14,18,26,0.99)); border:1px solid rgba(255,255,255,0.08); border-radius:18px; padding:36px; margin:0 0 24px; box-shadow:0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05);">
-            <div style="color:#6b7280; font-family:'Inter'; font-size:11px; letter-spacing:2px; margin-bottom:24px;">SIGN IN TO YOUR ACCOUNT</div>
+        <div style="background:rgba(8,8,16,0.8); backdrop-filter:blur(12px); border:1px solid rgba(0,245,255,0.25); border-radius:16px; padding:28px; margin:0 0 24px; box-shadow:0 8px 32px rgba(0,0,0,0.4), 0 0 30px rgba(0,245,255,0.06);">
+            <div style="color:rgba(0,245,255,0.9); font-family:'JetBrains Mono'; font-size:10px; letter-spacing:5px; margin-bottom:20px;">SIGN IN</div>
+        </div>
         """, unsafe_allow_html=True)
         with st.form("driver_login"):
             u = st.text_input("Username", placeholder="Enter username", label_visibility="collapsed")
@@ -531,15 +548,15 @@ def driver_login_screen():
                             st.error("Invalid username or password")
                     except Exception:
                         st.error("Login failed.")
-        st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("""
-        <div style="text-align:center; color:#4b5563; font-size:12px; margin-top:20px;">Demo credentials: <span style="color:#6b7280;">UNIT-07</span> / <span style="color:#6b7280;">TITAN-DRIVER</span></div>
+        <div style="text-align:center; color:rgba(0,245,255,0.6); font-size:11px; margin-top:20px; font-family:'JetBrains Mono';">Demo: <span style="color:#00f5ff;">UNIT-07</span> / <span style="color:#ff00ff;">TITAN-DRIVER</span></div>
         """, unsafe_allow_html=True)
     
     with auth_tab2:
         st.markdown("""
-        <div style="background:linear-gradient(145deg,rgba(20,24,34,0.98),rgba(14,18,26,0.99)); border:1px solid rgba(255,255,255,0.08); border-radius:18px; padding:36px; margin:0 0 24px; box-shadow:0 8px 32px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05);">
-            <div style="color:#6b7280; font-family:'Inter'; font-size:11px; letter-spacing:2px; margin-bottom:24px;">REGISTER NEW DRIVER</div>
+        <div style="background:rgba(8,8,16,0.8); backdrop-filter:blur(12px); border:1px solid rgba(0,245,255,0.25); border-radius:16px; padding:28px; margin:0 0 24px; box-shadow:0 8px 32px rgba(0,0,0,0.4), 0 0 30px rgba(0,245,255,0.06);">
+            <div style="color:rgba(0,245,255,0.9); font-family:'JetBrains Mono'; font-size:10px; letter-spacing:5px; margin-bottom:20px;">CREATE ACCOUNT</div>
+        </div>
         """, unsafe_allow_html=True)
         with st.form("driver_signup"):
             new_username = st.text_input("Username", placeholder="Choose username", label_visibility="collapsed", key="su_u")
@@ -558,7 +575,6 @@ def driver_login_screen():
                     else:
                         st.success(f"Account created! Unit ID: **{driver_id}**. Log in now.")
                         st.balloons()
-        st.markdown("</div>", unsafe_allow_html=True)
 
 def _current_speed():
     return random.randint(45, 72) if st.session_state.status == "EN_ROUTE" else 0
@@ -640,6 +656,7 @@ def update_server(org, dst, stat):
         pass
 
 def send_msg(stat, msg):
+    """Send message to HQ (driver_comms). Server reads this for V2X Comms."""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -647,8 +664,8 @@ def send_msg(stat, msg):
                   (datetime.datetime.now(), st.session_state.driver_id, stat, msg))
         conn.commit()
         conn.close()
-        st.toast(f"Status Updated: {stat}", icon="✅")
-    except: pass
+    except Exception:
+        pass
 
 def log_activity(action, actor, details=""):
     """Log activity for audit trail."""
@@ -663,33 +680,37 @@ def log_activity(action, actor, details=""):
     except Exception:
         return False
 
-def report_hazard():
-    """Inserts a hazard record at current location"""
+def report_hazard(hazard_type="OTHER"):
+    """Inserts a hazard record at current location with specified type."""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
+        type_str = f"{hazard_type}: {st.session_state.driver_id}" if hazard_type else "OTHER"
         c.execute("INSERT INTO hazards (lat, lon, type, timestamp) VALUES (?, ?, ?, ?)",
-                  (st.session_state.gps_lat, st.session_state.gps_lon, "CAUTION: REPORTED HAZARD", datetime.datetime.now()))
+                  (st.session_state.gps_lat, st.session_state.gps_lon, type_str, datetime.datetime.now()))
         conn.commit()
         conn.close()
         st.toast("Hazard Reported Successfully!", icon="⚠️")
-    except: pass
+    except Exception:
+        pass
 
 def check_orders():
-    """Fetch pending mission assigned to this driver (or unassigned). Expiry 30 min."""
+    """Fetch pending mission assigned to this driver (or unassigned). Expiry 30 min. Excludes persisted declines."""
     try:
         conn = sqlite3.connect(DB_FILE)
         conn.execute("PRAGMA journal_mode=WAL;")
+        driver_id = str(st.session_state.get("driver_id", ""))
         dfm = pd.read_sql_query(
             """
-            SELECT * FROM missions
-            WHERE status = 'DISPATCHED'
-              AND (assigned_driver_id IS NULL OR assigned_driver_id = ?)
-            ORDER BY id DESC
+            SELECT m.* FROM missions m
+            WHERE m.status = 'DISPATCHED'
+              AND (m.assigned_driver_id IS NULL OR m.assigned_driver_id = ?)
+              AND NOT EXISTS (SELECT 1 FROM mission_declines d WHERE d.mission_id = m.mission_id AND d.driver_id = ?)
+            ORDER BY m.id DESC
             LIMIT 5
             """,
             conn,
-            params=(str(st.session_state.get("driver_id", "")),),
+            params=(driver_id, driver_id),
         )
         conn.close()
         declined = st.session_state.get("declined_missions") or set()
@@ -700,7 +721,7 @@ def check_orders():
             created = pd.to_datetime(row.get("created_at"), errors="coerce")
             if pd.notna(created):
                 age_sec = (datetime.datetime.now() - created).total_seconds()
-                if age_sec < 1800:  # 30 min expiry
+                if age_sec < MISSION_EXPIRY_SEC:
                     return row.to_dict()
     except Exception:
         pass
@@ -750,9 +771,9 @@ if not st.session_state.driver_authenticated:
 # ==========================================
 def status_selection_screen():
     st.markdown("""
-    <div style="text-align:center; padding:48px 24px 40px;">
-        <div style="font-family:'Orbitron'; font-size:22px; font-weight:600; color:#e6edf3;">SET AVAILABILITY</div>
-        <div style="color:#6b7280; font-size:14px; margin-top:10px;">How are you starting your shift?</div>
+    <div style="text-align:center; padding:44px 24px 40px;">
+        <div style="font-family:'Orbitron', sans-serif; font-size:26px; letter-spacing:6px; color:#00f5ff; text-shadow:0 0 20px rgba(0,245,255,0.4);">SET AVAILABILITY</div>
+        <div style="color:rgba(0,245,255,0.6); font-size:13px; margin-top:10px; font-family:'Exo 2';">How are you starting your shift?</div>
     </div>
     """, unsafe_allow_html=True)
     
@@ -789,14 +810,38 @@ def status_selection_screen():
             st.rerun()
     
     st.markdown(f"""
-    <div style="text-align:center; color:#4b5563; font-size:12px; margin-top:20px;">Logged in as <span style="color:#6b7280;">{st.session_state.driver_id}</span></div>
+    <div style="text-align:center; color:rgba(0,245,255,0.6); font-size:11px; margin-top:20px; font-family:'JetBrains Mono';">Logged in as <span style="color:#00f5ff;">{st.session_state.driver_id}</span></div>
     """, unsafe_allow_html=True)
 
 if not st.session_state.status_set_on_login:
     status_selection_screen()
     st.stop()
 
-# No auto-poll fragment — use REFRESH button to check for missions (avoids stuck/crash)
+# Keep driver online when idle - heartbeat every 30s
+@st.fragment(run_every=30)
+def _keep_online():
+    if st.session_state.get("driver_authenticated") and st.session_state.get("availability") == "ACTIVE":
+        heartbeat()
+
+# Live mission poller - checks every 2s for new missions (no manual refresh needed)
+@st.fragment(run_every=2)
+def _mission_poller():
+    if not st.session_state.get("driver_authenticated"):
+        return
+    if st.session_state.get("status") != "IDLE" or st.session_state.get("availability") != "ACTIVE":
+        return
+    m = check_orders()
+    if m is None:
+        return
+    mid = m.get("mission_id")
+    declined = st.session_state.get("declined_missions") or set()
+    if mid and mid in declined:
+        return
+    last_poll = st.session_state.get("last_poll_mission_id")
+    if mid and mid != last_poll:
+        st.session_state.last_poll_mission_id = mid
+        st.session_state.pending_mission_sound = True
+        st.rerun()
 
 # Poll clearance on load
 try:
@@ -816,41 +861,53 @@ except Exception:
     _display_name = st.session_state.driver_username or st.session_state.driver_id or "Driver"
     _vehicle = _place = "—"
 shift_dur = int((time.time() - st.session_state.get("shift_start", time.time())) / 60)
-_accent = "#00ff9d" if st.session_state.clearance_status == "GRANTED" else "#00f3ff"
 # Status badge: Online (ACTIVE), Break, Inactive, or En Route
 _av = st.session_state.get("availability", "ACTIVE")
 _st = st.session_state.get("status", "IDLE")
 if _st == "EN_ROUTE":
     _status_badge = "EN ROUTE"
-    _status_bg = "#00ff9d"
+    _status_bg = "rgba(0,255,136,0.3)"
+    _status_border = "1px solid rgba(0,255,136,0.5)"
+    _status_text = "#00ff88"
 elif _av == "ACTIVE" and _st == "IDLE":
-    _status_badge = "🟢 ONLINE"
-    _status_bg = "#00ff9d"
+    _status_badge = "ONLINE"
+    _status_bg = "rgba(0,245,255,0.25)"
+    _status_border = "1px solid rgba(0,245,255,0.5)"
+    _status_text = "#00f5ff"
 elif _av == "BREAK":
     _status_badge = "BREAK"
-    _status_bg = "#ffaa00"
+    _status_bg = "rgba(255,0,255,0.25)"
+    _status_border = "1px solid rgba(255,0,255,0.5)"
+    _status_text = "#ff00ff"
 elif _av == "INACTIVE":
     _status_badge = "INACTIVE"
-    _status_bg = "#666"
+    _status_bg = "rgba(100,100,120,0.3)"
+    _status_border = "1px solid rgba(100,100,120,0.4)"
+    _status_text = "#888"
 else:
     _status_badge = str(_st)
-    _status_bg = "#555"
+    _status_bg = "rgba(100,100,120,0.3)"
+    _status_border = "1px solid rgba(100,100,120,0.4)"
+    _status_text = "#888"
 st.markdown(f"""
 <div class="mobile-header">
     <div>
-        <div style="font-family:'Orbitron'; font-size:18px; font-weight:600; color:#e6edf3;">{st.session_state.driver_id}</div>
-        <div style="font-size:13px; color:#e6edf3; font-weight:500; margin-top:2px;">{_display_name}</div>
-        <div style="font-size:11px; color:#6b7280; margin-top:4px;">{_vehicle} • {_place} • {shift_dur}m shift</div>
+        <div style="font-family:'Orbitron', sans-serif; font-size:22px; letter-spacing:4px; color:#00f5ff; text-shadow:0 0 15px rgba(0,245,255,0.3);">{st.session_state.driver_id}</div>
+        <div style="font-size:13px; color:#e8e8f0; font-weight:600; margin-top:4px; font-family:'Exo 2';">{_display_name}</div>
+        <div style="font-size:11px; color:rgba(0,245,255,0.6); margin-top:4px; font-family:'JetBrains Mono';">{_vehicle} • {_place} • {shift_dur}m</div>
     </div>
-    <div style="background:{_status_bg}; color:{"#000" if _status_bg in ["#00ff9d","#ffaa00"] else "#fff"}; padding:6px 14px; border-radius:8px; font-weight:600; font-size:11px; font-family:'Inter'; letter-spacing:0.5px;">
+    <div style="background:{_status_bg}; color:{_status_text}; padding:10px 18px; border-radius:12px; font-weight:700; font-size:11px; font-family:'JetBrains Mono'; letter-spacing:2px; border:{_status_border}; box-shadow:0 0 20px rgba(0,245,255,0.1);">
         {_status_badge}
     </div>
+</div>
+<div style="display:flex; justify-content:flex-end; margin-top:-4px; margin-bottom:8px; align-items:center;">
+    <span style="color:rgba(0,255,136,0.9); font-size:10px; font-family:'JetBrains Mono'; letter-spacing:2px;">● SYNCED</span>
 </div>
 """, unsafe_allow_html=True)
 if st.session_state.clearance_status == "GRANTED":
     st.markdown("""
-    <div style="background:rgba(5,150,105,0.15); border:1px solid rgba(5,150,105,0.4); border-radius:10px; padding:12px 16px; color:#10b981; font-weight:500;">
-        Signal cleared — Green Wave granted
+    <div style="background:rgba(0,255,136,0.1); backdrop-filter:blur(8px); border:1px solid rgba(0,255,136,0.5); border-radius:14px; padding:14px 20px; color:#00ff88; font-weight:700; font-family:'JetBrains Mono'; letter-spacing:2px; box-shadow:0 0 30px rgba(0,255,136,0.15);">
+        ✓ GREEN WAVE GRANTED
     </div>
     """, unsafe_allow_html=True)
     st.session_state.clearance_status = None  # reset after showing so we can request again later
@@ -863,8 +920,8 @@ if st.session_state.clearance_status == "GRANTED":
         pass
 elif st.session_state.clearance_status == "DENIED":
     st.markdown("""
-    <div style="background:rgba(220,38,38,0.1); border:1px solid rgba(220,38,38,0.3); border-radius:10px; padding:12px 16px; color:#f87171;">
-        Request denied
+    <div style="background:rgba(255,0,80,0.1); backdrop-filter:blur(8px); border:1px solid rgba(255,0,80,0.5); border-radius:14px; padding:14px 20px; color:#ff0050; font-weight:700; font-family:'JetBrains Mono'; letter-spacing:2px; box-shadow:0 0 30px rgba(255,0,80,0.15);">
+        ✗ REQUEST DENIED
     </div>
     """, unsafe_allow_html=True)
     st.session_state.clearance_status = None
@@ -876,11 +933,29 @@ elif st.session_state.clearance_status == "DENIED":
     except Exception:
         pass
 
+# Pending alert sound — show Play button when sound queued (HQ message or mission; fallback if autoplay blocked)
+if st.session_state.get("pending_sound_url") and st.session_state.get("sounds_enabled"):
+    _url = st.session_state.pending_sound_url
+    _ts = st.session_state.get("pending_sound_ts", 0)
+    if time.time() - _ts < 45:
+        st.markdown("""
+        <div style="background:rgba(255,0,80,0.15); border:1px solid rgba(255,0,80,0.5); border-radius:10px; padding:10px 14px; margin-bottom:12px; display:flex; align-items:center; gap:12px;">
+            <span style="color:#ff0050; font-weight:700;">🔔 New alert</span>
+            <span style="color:rgba(255,255,255,0.7); font-size:12px;">Tap to play sound</span>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("🔔 Play alert", key="play_pending_sound_top", use_container_width=True, type="primary"):
+            st.audio(_url, format="audio/mpeg", autoplay=True)
+            st.session_state.pending_sound_url = None
+            st.session_state.pending_sound_ts = 0
+            st.toast("Playing alert", icon="🔊")
+            st.rerun()
+
 # Action bar — aligned layout
-st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
 bar1, bar2, bar3 = st.columns([1, 2, 1])
 with bar1:
-    if st.button("Refresh", key="manual_refresh", use_container_width=True, help="Check for new missions"):
+    if st.button("🔄 Refresh", key="manual_refresh", use_container_width=True, help="Check for new missions"):
         st.rerun()
 with bar2:
     if st.session_state.status != "EN_ROUTE":
@@ -906,7 +981,13 @@ with bar2:
     else:
         st.caption("En route")
 with bar3:
-    if st.button("Logout", key="logout_btn", use_container_width=True):
+    if st.button("🚪 Logout", key="logout_btn", use_container_width=True):
+        # Clean up: mark driver offline in DB
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute("UPDATE drivers SET status='OFFLINE', last_seen=? WHERE driver_id=?", (datetime.datetime.now(), st.session_state.driver_id))
+        except Exception:
+            pass
         st.session_state.driver_authenticated = False
         st.session_state.driver_id = ""
         st.session_state.driver_username = ""
@@ -919,14 +1000,33 @@ with bar3:
 
 # 1. MISSION ALERT (or listening indicator)
 heartbeat()
+# Check if current mission was cancelled by HQ
+if st.session_state.active_mission_id:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            row = conn.execute("SELECT status FROM missions WHERE mission_id=?", (st.session_state.active_mission_id,)).fetchone()
+        if row and row[0] == "CANCELLED":
+            mid_cancelled = st.session_state.active_mission_id
+            st.session_state.active_mission_id = None
+            st.session_state.active_org = None
+            st.session_state.active_dst = None
+            st.session_state.status = "IDLE"
+            st.session_state.route_alternatives = []
+            st.session_state.route_selection_pending = False
+            st.error(f"Mission {mid_cancelled} was CANCELLED by HQ.")
+            st.rerun()
+    except Exception:
+        pass
 new_mission = check_orders()
 
 if st.session_state.status == "IDLE" and st.session_state.get("availability") == "ACTIVE" and new_mission is None:
     st.markdown("""
-    <div style="background:linear-gradient(145deg,rgba(6,182,212,0.12),rgba(6,182,212,0.04)); border:1px solid rgba(6,182,212,0.25); border-radius:14px; padding:20px 24px; margin:16px 0; color:#94a3b8; font-size:14px; box-shadow:0 4px 20px rgba(6,182,212,0.1);">
-        Ready for missions — Click <strong style="color:#06b6d4;">Refresh</strong> to check for dispatches from HQ.
+    <div style="background:rgba(8,8,16,0.8); backdrop-filter:blur(12px); border:1px solid rgba(0,245,255,0.3); border-radius:16px; padding:22px 24px; margin:20px 0; color:rgba(0,245,255,0.7); font-size:14px; font-family:'Exo 2'; box-shadow:0 8px 32px rgba(0,0,0,0.4), 0 0 30px rgba(0,245,255,0.06);">
+        <span style="color:#00f5ff; font-weight:700; text-shadow:0 0 15px rgba(0,245,255,0.4);">● LISTENING</span> — Updates every 2s. No refresh needed.
     </div>
     """, unsafe_allow_html=True)
+    if st.session_state.get("sounds_enabled"):
+        st.caption("🔊 Sound alerts ON — you'll hear when missions or HQ messages arrive")
     if st.session_state.declined_missions:
         if st.button("Undo decline", key="undo_decline"):
             st.session_state.declined_missions.clear()
@@ -943,7 +1043,7 @@ if new_mission is not None and st.session_state.status == "IDLE" and st.session_
     mid_esc = html.escape(str(mid))
     prio_esc = html.escape(str(prio))
     
-    prio_color = "#ef4444" if prio == "CRITICAL" else "#f59e0b" if prio == "HIGH" else "#06b6d4"
+    prio_color = "#ff0050" if prio == "CRITICAL" else "#ff00ff" if prio == "HIGH" else "#00f5ff"
     
     # Mission countdown (30 min expiry)
     created = pd.to_datetime(new_mission.get("created_at"), errors="coerce")
@@ -952,32 +1052,68 @@ if new_mission is not None and st.session_state.status == "IDLE" and st.session_
         age_sec = (datetime.datetime.now() - created).total_seconds()
         remaining = max(0, 1800 - age_sec)
         mins_left = f"{int(remaining // 60)} min"
-    countdown_html = f'<div style="color:#f59e0b; font-size:12px; margin-top:8px;">⏱ Expires in: {mins_left}</div>'
-    
-    notes_html = ""
+    # Build mission card HTML as single-line to avoid Streamlit multiline parsing
+    countdown_part = f'<div style="color:rgba(255,0,255,0.9); font-size:11px; margin-top:12px; font-family:JetBrains Mono,sans-serif;">⏱ EXPIRES: {mins_left}</div>'
+    notes_part = ""
     if new_mission.get("notes"):
         notes_escaped = html.escape(str(new_mission.get("notes", "") or ""))
-        notes_html = f'<div style="color:#aaa; font-size:12px; margin-top:10px; padding:10px; background:rgba(0,0,0,0.3); border-radius:8px; text-align:left;">📋 <strong>Notes:</strong> {notes_escaped}</div>'
-    st.markdown(f"""
-    <div class="mission-alert">
-        <div style="text-align:center; margin-bottom:16px;">
-            <div style="color:{prio_color}; font-family:'Inter'; font-size:11px; letter-spacing:2px; font-weight:600;">{prio_esc} PRIORITY</div>
-            <div style="color:#e6edf3; font-family:'Orbitron'; font-size:22px; margin:12px 0;">{org_esc}</div>
-            <div style="color:#6b7280; font-size:16px;">↓</div>
-            <div style="color:#e6edf3; font-family:'Orbitron'; font-size:22px;">{dst_esc}</div>
-            <div style="color:#6b7280; font-size:12px; margin-top:12px;">Mission {mid_esc}</div>
-            {countdown_html}
-            {notes_html}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        notes_part = f'<div style="color:rgba(0,245,255,0.7); font-size:12px; margin-top:14px; padding:14px; background:rgba(0,0,0,0.3); border-radius:12px; text-align:left; font-family:Exo 2,sans-serif; border:1px solid rgba(0,245,255,0.15);">📋 {notes_escaped}</div>'
+    mission_card_html = (
+        f'<div class="mission-alert">'
+        f'<div style="text-align:center;">'
+        f'<div style="color:{prio_color}; font-family:JetBrains Mono,sans-serif; font-size:10px; letter-spacing:5px; font-weight:700;">{prio_esc} PRIORITY</div>'
+        f'<div style="color:#e8e8f0; font-family:Orbitron,sans-serif; font-size:22px; margin:14px 0; letter-spacing:2px;">{org_esc}</div>'
+        f'<div style="color:#00f5ff; font-size:20px; text-shadow:0 0 20px rgba(0,245,255,0.4);">↓</div>'
+        f'<div style="color:#e8e8f0; font-family:Orbitron,sans-serif; font-size:22px; margin:14px 0; letter-spacing:2px;">{dst_esc}</div>'
+        f'<div style="color:rgba(0,245,255,0.7); font-size:11px; margin-top:10px; font-family:JetBrains Mono,sans-serif;">{mid_esc}</div>'
+        f'{countdown_part}{notes_part}'
+        f'</div></div>'
+    )
+    # Play mission alert sound when new mission arrives — auto-play to alert distracted driver
+    if st.session_state.get("pending_mission_sound"):
+        st.session_state.pending_mission_sound = False
+        if st.session_state.get("sounds_enabled"):
+            st.session_state.pending_sound_url = SOUND_MISSION
+            st.session_state.pending_sound_ts = time.time()
+            # Try autoplay — works if user has interacted with page (login, status select)
+            st.audio(SOUND_MISSION, format="audio/mpeg", autoplay=True)
+            st.toast("🔔 New mission — check below!", icon="🚨")
+    st.markdown(mission_card_html, unsafe_allow_html=True)
+    # Fallback: if autoplay was blocked, show tap-to-play button below mission card
+    if st.session_state.get("pending_sound_url") and st.session_state.get("sounds_enabled"):
+        _url = st.session_state.pending_sound_url
+        _ts = st.session_state.get("pending_sound_ts", 0)
+        if time.time() - _ts < 45:
+            st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+            if st.button("🔔 Play alert sound (tap if you didn't hear it)", key="play_pending_sound", use_container_width=True, type="primary"):
+                st.audio(_url, format="audio/mpeg", autoplay=True)
+                st.session_state.pending_sound_url = None
+                st.session_state.pending_sound_ts = 0
+                st.rerun()
     
     s_coords = HOSPITALS.get(org, [10.015, 76.34])
     d_coords = HOSPITALS.get(dst, [10.015, 76.34])
-
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
     col_acc, col_ign = st.columns([1, 1])
     with col_acc:
-        if st.button("Accept mission", key="accept_mission_btn"):
+        if st.button("✓ Accept mission", key="accept_mission_btn", use_container_width=True):
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                # Atomic accept: only succeed if mission still unassigned or assigned to this driver
+                c.execute(
+                    "UPDATE missions SET status='ACCEPTED', accepted_at=?, assigned_driver_id=? WHERE mission_id=? AND (assigned_driver_id IS NULL OR assigned_driver_id=?)",
+                    (datetime.datetime.now(), st.session_state.driver_id, mid, st.session_state.driver_id),
+                )
+                rows = c.rowcount
+                conn.commit()
+                conn.close()
+                if rows == 0:
+                    st.warning("Mission was already accepted by another unit.")
+                    st.rerun()
+            except Exception as e:
+                st.error("Database update failed. Mission may not sync with HQ.")
+                st.rerun()
             log_activity("ACCEPT", st.session_state.driver_id, mid)
             st.session_state.active_org = org
             st.session_state.active_dst = dst
@@ -986,49 +1122,46 @@ if new_mission is not None and st.session_state.status == "IDLE" and st.session_
             coords = HOSPITALS.get(org, [10.015, 76.34])
             st.session_state.gps_lat, st.session_state.gps_lon = coords[0], coords[1]
             update_server(org, dst, "EN_ROUTE")
-            try:
-                conn = sqlite3.connect(DB_FILE)
-                c = conn.cursor()
-                c.execute("UPDATE missions SET status='ACCEPTED', accepted_at=?, assigned_driver_id=? WHERE mission_id=?", (datetime.datetime.now(), st.session_state.driver_id, mid))
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
             # 4-route logic: compute alternatives and show selection
             if s_coords and d_coords:
-                st.session_state.route_alternatives = fetch_route_alternatives_4(s_coords, d_coords)
+                with st.spinner("Loading route options..."):
+                    st.session_state.route_alternatives = fetch_route_alternatives_4(s_coords, d_coords)
                 st.session_state.route_selection_pending = True
             heartbeat()
             st.rerun()
     with col_ign:
         if st.session_state.pending_decline_mid == mid:
             decline_reason = st.selectbox("Reason (optional)", ["—", "Too far", "On break", "Vehicle issue", "Other"], key="decline_reason")
-            c1, c2 = st.columns(2)
+            c1, c2 = st.columns([1, 1])
             with c1:
-                if st.button("Confirm", key="confirm_decline"):
+                if st.button("Confirm decline", key="confirm_decline", use_container_width=True):
                     reason = decline_reason if decline_reason != "—" else ""
-                    if reason:
-                        try:
-                            conn = sqlite3.connect(DB_FILE)
+                    try:
+                        with sqlite3.connect(DB_FILE) as conn:
                             conn.execute("PRAGMA journal_mode=WAL;")
                             try:
                                 conn.execute("ALTER TABLE missions ADD COLUMN decline_reason TEXT")
                             except sqlite3.OperationalError:
                                 pass
                             conn.execute("UPDATE missions SET decline_reason=? WHERE mission_id=?", (reason, mid))
+                            conn.execute("UPDATE missions SET assigned_driver_id=NULL WHERE mission_id=?", (mid,))
+                            conn.execute(
+                                "INSERT OR REPLACE INTO mission_declines (mission_id, driver_id, declined_at, reason) VALUES (?, ?, ?, ?)",
+                                (mid, st.session_state.driver_id, datetime.datetime.now(), reason),
+                            )
                             conn.commit()
-                            conn.close()
-                        except Exception:
-                            pass
+                    except Exception:
+                        st.error("Failed to update mission status.")
+                    send_msg("DECLINE", f"Mission {mid} declined by {st.session_state.driver_id}. Reason: {reason}".strip())
                     log_activity("DECLINE", st.session_state.driver_id, f"{mid} {reason}".strip())
                     st.session_state.declined_missions.add(mid)
                     st.session_state.pending_decline_mid = None
                     st.rerun()
             with c2:
-                if st.button("Cancel", key="cancel_decline"):
+                if st.button("← Back", key="cancel_decline", use_container_width=True):
                     st.session_state.pending_decline_mid = None
                     st.rerun()
-        elif st.button("Decline", key="decline_mission_btn"):
+        elif st.button("✕ Decline", key="decline_mission_btn", use_container_width=True):
             st.session_state.pending_decline_mid = mid
             st.rerun()
 
@@ -1053,11 +1186,11 @@ if st.session_state.route_selection_pending and st.session_state.route_alternati
         with r_col1:
             st.markdown(f"""
             <div class="route-card {best_class}">
-                <div style="font-weight:600; color:#e6edf3; font-size:15px;">{r.get('route_type', f'Route {i+1}')}</div>
-                <div style="display:flex; align-items:center; gap:16px; margin-top:8px; font-size:13px;">
-                    <span style="color:{c}; font-weight:500;">{r.get('eta', 0)} min</span>
-                    <span style="color:#4b5563;">|</span>
-                    <span style="color:#9ca3af;">{r.get('dist', 0)} km</span>
+                <div style="font-weight:700; color:#e8e8f0; font-size:15px; font-family:Orbitron,sans-serif; letter-spacing:2px;">{r.get('route_type', f'Route {i+1}')}</div>
+                <div style="display:flex; align-items:center; gap:16px; margin-top:10px; font-size:13px; font-family:JetBrains Mono,sans-serif;">
+                    <span style="color:#00f5ff; font-weight:700;">{r.get('eta', 0)} min</span>
+                    <span style="color:rgba(0,245,255,0.3);">|</span>
+                    <span style="color:rgba(0,245,255,0.6);">{r.get('dist', 0)} km</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -1070,34 +1203,177 @@ if st.session_state.route_selection_pending and st.session_state.route_alternati
     st.stop()
 
 # Main tabs
-tab_drive, tab_map, tab_comms, tab_stats, tab_alerts, tab_missions, tab_settings = st.tabs([
-    "Dashboard", "Navigation", "Comms", "Stats", "Alerts", "Missions", "Settings"
+# Global notification checker - popup + sound for new HQ messages (runs every 3s, any tab)
+@st.fragment(run_every=3)
+def _global_hq_notify():
+    if not st.session_state.get("driver_authenticated"):
+        return
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute(
+            "SELECT id, message, status FROM driver_comms WHERE (status LIKE 'HQ%' OR driver_id='ALL' OR driver_id=?) ORDER BY id DESC LIMIT 1",
+            (st.session_state.driver_id,)
+        ).fetchone()
+        conn.close()
+        if row:
+            max_id, msg_text, msg_type = row[0], str(row[1] or "")[:50], str(row[2] or "")
+            last_seen = st.session_state.get("last_seen_hq_message_id", 0)
+            if last_seen == 0:
+                st.session_state.last_seen_hq_message_id = max_id
+            elif max_id > last_seen:
+                st.session_state.last_seen_hq_message_id = max_id
+                if st.session_state.get("sounds_enabled"):
+                    sound_url = SOUND_MISSION if "GREENWAVE" in msg_type else SOUND_ALERT
+                    st.session_state.pending_sound_url = sound_url
+                    st.session_state.pending_sound_ts = time.time()
+                    # Try autoplay — works if user has interacted with page
+                    st.audio(sound_url, format="audio/mpeg", autoplay=True)
+                st.toast(f"📬 New from HQ: {msg_text}...", icon="🟢" if "GREENWAVE" in msg_type else "📡")
+                st.rerun()  # Rerun so Play alert button appears if autoplay was blocked
+    except Exception:
+        pass  # Silent - don't block UI on comms fetch failure
+
+tab_drive, tab_map, tab_comms, tab_alerts, tab_missions, tab_stats, tab_settings = st.tabs([
+    "🏠 Home", "🗺️ Map", "📶 Comms", "⚠️ Alerts", "📋 Missions", "📊 Stats", "⚙️ Settings"
 ])
 
+# Invoke fragments so they run (mission poller, HQ notify, heartbeat)
+_keep_online()
+_mission_poller()
+_global_hq_notify()
+
 with tab_drive:
+    # === DASHBOARD: Rich, professional layout ===
     current_speed = random.randint(45, 72) if st.session_state.status == "EN_ROUTE" else 0
-    st.markdown(f"""
-    <div style="padding:24px 0;">
-        <div class="speed-circle">
-            <div class="speed-val">{current_speed}</div>
-            <div class="speed-unit">KM/H</div>
+    shift_dur = int((time.time() - st.session_state.get("shift_start", time.time())) / 60)
+    completed = 0
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM missions WHERE assigned_driver_id=? AND status='COMPLETED'",
+                (st.session_state.driver_id,)
+            ).fetchone()
+            completed = row[0] if row else 0
+    except Exception:
+        pass
+
+    # Row 1: Speedometer + Active mission / status
+    dash_col1, dash_col2 = st.columns([1, 1])
+    with dash_col1:
+        st.markdown(f"""
+        <div style="padding:16px 0;">
+            <div class="speed-circle">
+                <div class="speed-val">{current_speed}</div>
+                <div class="speed-unit">KM/H</div>
+            </div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    if st.session_state.status == "EN_ROUTE" and st.session_state.active_dst:
-         d_coords = HOSPITALS.get(st.session_state.active_dst)
-         dist = geodesic((st.session_state.gps_lat, st.session_state.gps_lon), d_coords).km if d_coords else 0
-         eta = int(dist * 60 / 40)
-         c1, c2 = st.columns(2)
-         with c1: st.markdown(f"""<div class="widget-box"><div class="w-title">Remaining</div><div class="w-val">{dist:.1f} km</div></div>""", unsafe_allow_html=True)
-         with c2: st.markdown(f"""<div class="widget-box"><div class="w-title">ETA</div><div class="w-val">{eta} min</div></div>""", unsafe_allow_html=True)
-    else:
-         st.markdown("""
-         <div style="background:linear-gradient(145deg,rgba(24,28,38,0.9),rgba(14,18,26,0.95)); border:1px solid rgba(255,255,255,0.06); border-radius:16px; padding:32px; text-align:center; color:#6b7280; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
-             System idle — Awaiting dispatch
-         </div>
-         """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+    with dash_col2:
+        if st.session_state.status == "EN_ROUTE" and st.session_state.active_dst:
+            d_coords = HOSPITALS.get(st.session_state.active_dst)
+            dist = geodesic((st.session_state.gps_lat, st.session_state.gps_lon), d_coords).km if d_coords else 0
+            eta = int(dist * 60 / 40)
+            org_short = (st.session_state.active_org or "—")[:20]
+            dst_short = (st.session_state.active_dst or "—")[:20]
+            st.markdown(f"""
+            <div style="background:rgba(8,8,16,0.8); backdrop-filter:blur(12px); border:1px solid rgba(0,245,255,0.3); border-radius:16px; padding:22px; margin:18px 0; box-shadow:0 8px 32px rgba(0,0,0,0.4), 0 0 30px rgba(0,245,255,0.08);">
+                <div style="color:rgba(0,245,255,0.9); font-size:9px; letter-spacing:4px; margin-bottom:12px; font-family:JetBrains Mono,sans-serif;">ACTIVE MISSION</div>
+                <div style="color:#e8e8f0; font-family:Orbitron,sans-serif; font-size:16px; margin:6px 0; letter-spacing:1px;">{html.escape(org_short)}</div>
+                <div style="color:#00f5ff; font-size:16px; text-shadow:0 0 15px rgba(0,245,255,0.4);">↓</div>
+                <div style="color:#e8e8f0; font-family:Orbitron,sans-serif; font-size:16px; margin:6px 0; letter-spacing:1px;">{html.escape(dst_short)}</div>
+                <div style="display:flex; justify-content:space-between; margin-top:16px; padding-top:14px; border-top:1px solid rgba(0,245,255,0.15);">
+                    <div style="text-align:center;"><span style="color:rgba(0,245,255,0.6); font-size:9px; font-family:JetBrains Mono,sans-serif;">REMAINING</span><br><span style="color:#00ff88; font-weight:700; font-family:JetBrains Mono,sans-serif;">{dist:.1f} km</span></div>
+                    <div style="text-align:center;"><span style="color:rgba(0,245,255,0.6); font-size:9px; font-family:JetBrains Mono,sans-serif;">ETA</span><br><span style="color:#00f5ff; font-weight:700; font-family:JetBrains Mono,sans-serif;">{eta} min</span></div>
+                    <div style="text-align:center;"><span style="color:rgba(0,245,255,0.6); font-size:9px; font-family:JetBrains Mono,sans-serif;">ARRIVAL</span><br><span style="color:#e8e8f0; font-weight:700; font-family:JetBrains Mono,sans-serif;">{(datetime.datetime.now() + datetime.timedelta(minutes=eta)).strftime('%H:%M')}</span></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            if d_coords and len(d_coords) >= 2:
+                nav_url = f"https://www.google.com/maps/dir/?api=1&destination={d_coords[0]},{d_coords[1]}&travelmode=driving"
+                st.link_button("📍 Open in Google Maps", nav_url, use_container_width=True, help="Navigate to destination")
+        else:
+            st.markdown(f"""
+            <div style="background:rgba(8,8,16,0.8); backdrop-filter:blur(12px); border:1px solid rgba(0,245,255,0.2); border-radius:16px; padding:28px; margin:18px 0; text-align:center; box-shadow:0 8px 32px rgba(0,0,0,0.4), 0 0 25px rgba(0,245,255,0.05);">
+                <div style="font-size:40px; margin-bottom:12px;">🚑</div>
+                <div style="color:#00f5ff; font-weight:700; font-size:18px; font-family:Orbitron,sans-serif; letter-spacing:3px; text-shadow:0 0 20px rgba(0,245,255,0.3);">READY FOR DISPATCH</div>
+                <div style="color:rgba(0,245,255,0.6); font-size:13px; margin-top:8px; font-family:Exo 2,sans-serif;">Awaiting mission assignment</div>
+                <div style="color:rgba(0,245,255,0.9); font-size:11px; margin-top:14px; font-family:JetBrains Mono,sans-serif; letter-spacing:2px;">● LISTENING 2s</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # Row 2: Quick stats strip
+    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+    q1, q2, q3, q4 = st.columns(4)
+    with q1:
+        st.markdown(f"""<div class="widget-box"><div class="w-title">Shift</div><div class="w-val">{shift_dur}m</div></div>""", unsafe_allow_html=True)
+    with q2:
+        st.markdown(f"""<div class="widget-box"><div class="w-title">Missions</div><div class="w-val">{completed}</div></div>""", unsafe_allow_html=True)
+    with q3:
+        status_txt = "En route" if st.session_state.status == "EN_ROUTE" else "Idle"
+        status_c = "#00ff88" if st.session_state.status == "EN_ROUTE" else "#00f5ff"
+        st.markdown(f"""<div class="widget-box"><div class="w-title">Status</div><div class="w-val" style="color:{status_c};">{status_txt}</div></div>""", unsafe_allow_html=True)
+    with q4:
+        avg_s = random.randint(48, 65) if st.session_state.status == "EN_ROUTE" else 0
+        st.markdown(f"""<div class="widget-box"><div class="w-title">Avg</div><div class="w-val">{avg_s} km/h</div></div>""", unsafe_allow_html=True)
+
+    # Row 3: Quick actions
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+    _qa_lbl = "color:#8e8e93; font-size:10px; letter-spacing:4px; margin-bottom:8px"
+    st.markdown(f"<div style='{_qa_lbl}; font-family:JetBrains Mono,sans-serif'>QUICK ACTIONS</div>", unsafe_allow_html=True)
+    qa1, qa2, qa3, qa4 = st.columns(4)
+    with qa1:
+        if st.button("🆘 SOS", use_container_width=True, key="dash_sos"):
+            send_msg("CRITICAL", f"SOS — {st.session_state.driver_id} EMERGENCY ASSISTANCE REQUIRED")
+            st.toast("SOS sent to HQ!", icon="🚨")
+            st.rerun()
+    with qa2:
+        if st.button("🟢 Green", use_container_width=True, key="dash_green"):
+            send_msg("GREENWAVE", f"Green Wave request from {st.session_state.driver_id}")
+            st.toast("Green Wave requested", icon="🟢")
+            st.rerun()
+    with qa3:
+        if st.session_state.status == "EN_ROUTE" and st.button("👤 Patient", use_container_width=True, key="dash_patient"):
+            send_msg("STATUS", f"PATIENT SECURED - {st.session_state.driver_id} en route to {st.session_state.active_dst or 'destination'}")
+            st.toast("Status sent", icon="✅")
+            st.rerun()
+        elif st.session_state.status != "EN_ROUTE":
+            st.button("👤 Patient", use_container_width=True, key="dash_patient", disabled=True)
+    with qa4:
+        if st.button("🚧 Obstruction", use_container_width=True, key="dash_obst"):
+            send_msg("WARNING", f"TRAFFIC OBSTRUCTION - {st.session_state.driver_id}")
+            st.toast("Reported to HQ", icon="⚠️")
+            st.rerun()
+
+    # Row 4: Recent activity feed
+    st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+    _rfh_lbl = "color:#8e8e93; font-size:10px; letter-spacing:4px; margin-bottom:8px"
+    st.markdown(f"<div style='{_rfh_lbl}; font-family:JetBrains Mono,sans-serif'>RECENT FROM HQ</div>", unsafe_allow_html=True)
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            msgs = conn.execute(
+                "SELECT message, status, timestamp FROM driver_comms WHERE (status LIKE 'HQ%' OR driver_id='ALL' OR driver_id=?) ORDER BY id DESC LIMIT 4",
+                (st.session_state.driver_id,)
+            ).fetchall()
+        if msgs:
+            for msg_row in msgs:
+                msg_txt = (msg_row[0] or "")[:60] + ("..." if len(str(msg_row[0] or "")) > 60 else "")
+                msg_type = str(msg_row[1] or "")
+                msg_time = str(msg_row[2] or "")[-8:] if msg_row[2] else ""
+                icon = "🟢" if "GREENWAVE" in msg_type else "📡"
+                st.markdown(f"""
+                <div style="background:rgba(8,8,16,0.7); backdrop-filter:blur(8px); padding:14px 18px; border-radius:14px; margin-bottom:10px; border-left:4px solid rgba(0,245,255,0.5); font-size:13px; border:1px solid rgba(0,245,255,0.15); box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+                    <span style="color:#00f5ff;">{icon}</span> <span style="color:#e8e8f0; font-family:Exo 2,sans-serif;">{html.escape(msg_txt)}</span>
+                    <span style="color:rgba(0,245,255,0.5); font-size:10px; float:right; font-family:JetBrains Mono,sans-serif;">{msg_time}</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div style="background:rgba(8,8,16,0.6); backdrop-filter:blur(8px); padding:24px; border-radius:14px; color:rgba(0,245,255,0.5); font-size:13px; text-align:center; border:1px solid rgba(0,245,255,0.15); font-family:Exo 2,sans-serif; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+                No messages yet — HQ will appear here
+            </div>
+            """, unsafe_allow_html=True)
+    except Exception:
+        st.caption("Unable to load messages")
 
 with tab_map:
     if st.session_state.status == "EN_ROUTE":
@@ -1115,29 +1391,29 @@ with tab_map:
         st_folium(m, height=350, width=None, returned_objects=[])
         
         st.markdown(f"""
-        <div style="background:rgba(20,24,32,0.9); padding:18px; border-radius:12px; margin:12px 0; border:1px solid rgba(255,255,255,0.05); border-left:3px solid #06b6d4;">
+        <div style="background:rgba(8,8,16,0.8); backdrop-filter:blur(12px); padding:22px; border-radius:16px; margin:16px 0; border:1px solid rgba(0,245,255,0.25); border-left:4px solid #00f5ff; box-shadow:0 8px 32px rgba(0,0,0,0.4), 0 0 25px rgba(0,245,255,0.06);">
             <div style="display:flex; justify-content:space-between; align-items:center;">
                 <div>
-                    <div style="color:#6b7280; font-size:11px;">Route</div>
-                    <div style="color:#e6edf3; font-family:'Orbitron'; font-size:15px;">{best.get('route_type', 'FASTEST')}</div>
+                    <div style="color:rgba(0,245,255,0.6); font-size:10px; font-family:JetBrains Mono,sans-serif;">ROUTE</div>
+                    <div style="color:#00f5ff; font-family:Orbitron,sans-serif; font-size:18px; letter-spacing:2px;">{best.get('route_type', 'FASTEST')}</div>
                 </div>
                 <div style="text-align:right;">
-                    <div style="color:#6b7280; font-size:11px;">Delay</div>
-                    <div style="color:#f59e0b; font-size:14px;">+{best.get('traffic_delay_min', 0)} min</div>
+                    <div style="color:rgba(0,245,255,0.6); font-size:10px; font-family:JetBrains Mono,sans-serif;">DELAY</div>
+                    <div style="color:#ff00ff; font-size:14px; font-family:JetBrains Mono,sans-serif; font-weight:700;">+{best.get('traffic_delay_min', 0)} min</div>
                 </div>
             </div>
-            <div style="display:flex; justify-content:space-around; margin-top:16px; padding-top:14px; border-top:1px solid rgba(255,255,255,0.06);">
+            <div style="display:flex; justify-content:space-around; margin-top:18px; padding-top:16px; border-top:1px solid rgba(0,245,255,0.15);">
                 <div style="text-align:center;">
-                    <div style="color:#10b981; font-family:'Orbitron'; font-size:22px;">{best.get('dist', 0)}</div>
-                    <div style="color:#6b7280; font-size:11px;">km</div>
+                    <div style="color:#00ff88; font-family:JetBrains Mono,sans-serif; font-size:22px; font-weight:700;">{best.get('dist', 0)}</div>
+                    <div style="color:rgba(0,245,255,0.5); font-size:10px; font-family:JetBrains Mono,sans-serif;">km</div>
                 </div>
                 <div style="text-align:center;">
-                    <div style="color:#06b6d4; font-family:'Orbitron'; font-size:22px;">{best.get('eta', 0)}</div>
-                    <div style="color:#6b7280; font-size:11px;">min ETA</div>
+                    <div style="color:#00f5ff; font-family:JetBrains Mono,sans-serif; font-size:22px; font-weight:700;">{best.get('eta', 0)}</div>
+                    <div style="color:rgba(0,245,255,0.5); font-size:10px; font-family:JetBrains Mono,sans-serif;">min ETA</div>
                 </div>
                 <div style="text-align:center;">
-                    <div style="color:#e6edf3; font-family:'Orbitron'; font-size:22px;">{(datetime.datetime.now() + datetime.timedelta(minutes=best.get('eta', 0))).strftime('%H:%M')}</div>
-                    <div style="color:#6b7280; font-size:11px;">arrival</div>
+                    <div style="color:#e8e8f0; font-family:JetBrains Mono,sans-serif; font-size:22px; font-weight:700;">{(datetime.datetime.now() + datetime.timedelta(minutes=best.get('eta', 0))).strftime('%H:%M')}</div>
+                    <div style="color:rgba(0,245,255,0.5); font-size:10px; font-family:JetBrains Mono,sans-serif;">arrival</div>
                 </div>
             </div>
         </div>
@@ -1151,14 +1427,18 @@ with tab_map:
                     msg = ins if isinstance(ins, str) else (ins.get('message', '') if isinstance(ins, dict) else str(ins))
                     icon = "➡️" if "right" in msg.lower() else "⬅️" if "left" in msg.lower() else "⬆️"
                     st.markdown(f"""
-                    <div style="padding:8px; border-bottom:1px solid #222; display:flex; align-items:center;">
+                    <div style="padding:10px 8px; border-bottom:1px solid #222; display:flex; align-items:center; font-family:'Space Grotesk';">
                         <span style="font-size:16px; margin-right:10px;">{icon}</span>
-                        <span style="color:#fff; font-size:12px;">{msg}</span>
+                        <span style="color:#f5f5f5; font-size:12px;">{msg}</span>
                     </div>
                     """, unsafe_allow_html=True)
             else:
                 st.info("Follow the highlighted route on the map.")
 
+        # Navigate to destination
+        if dest and len(dest) >= 2:
+            nav_url = f"https://www.google.com/maps/dir/?api=1&destination={dest[0]},{dest[1]}&travelmode=driving"
+            st.link_button("📍 Open in Google Maps", nav_url, use_container_width=True, help="Navigate to destination")
         st.markdown("#### Status updates")
         arr1, arr2 = st.columns([1, 1])
         with arr1:
@@ -1195,18 +1475,31 @@ with tab_map:
                         st.session_state.route_selection_pending = False
                         update_server("NONE", "NONE", "IDLE")
                         if st.session_state.active_mission_id:
+                            mid_complete = st.session_state.active_mission_id
+                            org_d = st.session_state.active_org or "—"
+                            dst_d = st.session_state.active_dst or "—"
                             try:
-                                conn = sqlite3.connect(DB_FILE)
-                                c = conn.cursor()
-                                c.execute("UPDATE missions SET status='COMPLETED', completed_at=? WHERE mission_id=?", (datetime.datetime.now(), st.session_state.active_mission_id))
-                                conn.commit()
-                                conn.close()
+                                with sqlite3.connect(DB_FILE) as conn:
+                                    conn.execute("UPDATE missions SET status='COMPLETED', completed_at=? WHERE mission_id=?", (datetime.datetime.now(), mid_complete))
+                                    row = conn.execute("SELECT accepted_at FROM missions WHERE mission_id=?", (mid_complete,)).fetchone()
+                                    if row and row[0] and org_d in HOSPITALS and dst_d in HOSPITALS:
+                                        accepted = pd.to_datetime(row[0], errors="coerce")
+                                        if pd.notna(accepted):
+                                            actual_min = (datetime.datetime.now() - accepted).total_seconds() / 60
+                                            dist = distance_km(HOSPITALS[org_d][0], HOSPITALS[org_d][1], HOSPITALS[dst_d][0], HOSPITALS[dst_d][1])
+                                            avg_speed = round(dist / (actual_min / 60), 1) if actual_min > 0 else 0
+                                            time_saved = max(0, round(actual_min * 0.1, 1))
+                                            co2_saved = round(calculate_co2_savings(dist, time_saved), 2)
+                                            conn.execute(
+                                                "UPDATE mission_logs SET time_saved=?, co2_saved=?, avg_speed=? WHERE mission_id=?",
+                                                (time_saved, co2_saved, avg_speed, mid_complete),
+                                            )
+                                    conn.commit()
+                                send_msg("STATUS", f"MISSION COMPLETE - {mid_complete} by {st.session_state.driver_id}. {org_d} → {dst_d}")
                             except Exception:
                                 pass
-                        mid_complete = st.session_state.active_mission_id
-                        st.session_state.active_mission_id = None
-                        if mid_complete:
                             log_activity("COMPLETE", st.session_state.driver_id, mid_complete)
+                        st.session_state.active_mission_id = None
                         heartbeat()
                         st.rerun()
                 with c2:
@@ -1275,8 +1568,8 @@ with tab_map:
             opts = st.session_state.manual_route_alternatives
             st.markdown("#### Choose route")
             st.markdown(f"""
-            <div style="color:#6b7280; font-size:13px; margin-bottom:16px; padding:12px 16px; background:rgba(20,24,32,0.6); border-radius:10px; border:1px solid rgba(255,255,255,0.05);">
-                <span style="color:#9ca3af;">From</span> {org_label} <span style="color:#6b7280;">→</span> <span style="color:#9ca3af;">To</span> {dst}
+            <div style="color:rgba(0,245,255,0.7); font-size:14px; margin-bottom:18px; padding:16px 20px; background:rgba(8,8,16,0.7); border-radius:14px; border:1px solid rgba(0,245,255,0.2); font-family:Exo 2,sans-serif; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+                <span style="color:#00f5ff;">From</span> {org_label} <span style="color:rgba(0,245,255,0.3);">→</span> <span style="color:#ff00ff;">To</span> {dst}
             </div>
             """, unsafe_allow_html=True)
             route_colors = ["#06b6d4", "#f59e0b", "#10b981", "#ec4899"]
@@ -1287,11 +1580,11 @@ with tab_map:
                 with m_col1:
                     st.markdown(f"""
                     <div class="route-card{' route-card-best' if is_best else ''}">
-                        <div style="font-weight:600; color:#e6edf3; font-size:14px;">{opt.get('route_type', f'Route {idx+1}')}</div>
-                        <div style="display:flex; align-items:center; gap:12px; margin-top:8px; font-size:13px;">
-                            <span style="color:{c}; font-weight:500;">{opt.get('eta', 0)} min</span>
-                            <span style="color:#4b5563;">|</span>
-                            <span style="color:#9ca3af;">{opt.get('dist', 0)} km</span>
+                        <div style="font-weight:700; color:#e8e8f0; font-size:15px; font-family:Orbitron,sans-serif; letter-spacing:2px;">{opt.get('route_type', f'Route {idx+1}')}</div>
+                        <div style="display:flex; align-items:center; gap:14px; margin-top:10px; font-size:13px; font-family:JetBrains Mono,sans-serif;">
+                            <span style="color:#00f5ff; font-weight:700;">{opt.get('eta', 0)} min</span>
+                            <span style="color:rgba(0,245,255,0.3);">|</span>
+                            <span style="color:rgba(0,245,255,0.6);">{opt.get('dist', 0)} km</span>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -1319,182 +1612,148 @@ with tab_map:
                     st.rerun()
 
 with tab_comms:
-    st.markdown("### Communications")
+    st.markdown("### 📶 Communications")
+    st.caption("One-tap actions at top — no scrolling while driving")
     
-    st.markdown("""
-    <div style="background:rgba(20,24,32,0.8); border:1px solid rgba(255,255,255,0.05); border-radius:12px; padding:12px 16px; margin-bottom:20px; display:flex; justify-content:space-between; align-items:center;">
-        <span style="color:#6b7280; font-size:12px;">V2X connection</span>
-        <span style="color:#10b981; font-size:12px; font-weight:600;">● Active</span>
-    </div>
-    """, unsafe_allow_html=True)
+    # ========== TOP: ONE-TAP ACTIONS (no scroll needed) ==========
+    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+    st.markdown("**⚡ Quick reply**")
+    qr1, qr2, qr3 = st.columns(3)
+    QUICK_REPLIES = [
+        ("Copy", "Copy. Acknowledged."),
+        ("ETA 5 min", "ETA 5 minutes to destination."),
+        ("On my way", "On my way to pickup."),
+        ("Arrived", "Arrived at scene."),
+        ("En route", "En route to hospital."),
+        ("Delayed", "Traffic delay — ETA updated."),
+    ]
+    for i, (label, msg) in enumerate(QUICK_REPLIES):
+        with [qr1, qr2, qr3][i % 3]:
+            if st.button(f"📤 {label}", key=f"qr_{i}", use_container_width=True):
+                send_msg("STATUS", f"{st.session_state.driver_id}: {msg}")
+                st.toast(f"Sent: {label}", icon="✅")
+                st.rerun()
     
-    st.markdown("#### Emergency")
-    if st.button("SOS — Emergency Alert", use_container_width=True, type="primary", key="sos_btn"):
-        send_msg("CRITICAL", f"🆘 SOS - {st.session_state.driver_id} EMERGENCY at ({st.session_state.gps_lat:.4f}, {st.session_state.gps_lon:.4f}) - Immediate assistance required!")
-        st.error("SOS sent to HQ. Help is on the way.")
-        st.rerun()
-    st.markdown("---")
-    st.markdown("#### Green Wave")
-    
-    gw_cols = st.columns([1, 1])
-    with gw_cols[0]:
-        if st.button("Request Green Wave", use_container_width=True):
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+    st.markdown("**🆘 Emergency & status**")
+    em1, em2, em3, em4 = st.columns(4)
+    with em1:
+        if st.button("🆘 SOS", use_container_width=True, type="primary", key="sos_btn"):
+            send_msg("CRITICAL", f"🆘 SOS - {st.session_state.driver_id} EMERGENCY at ({st.session_state.gps_lat:.4f}, {st.session_state.gps_lon:.4f}) - Immediate assistance required!")
+            st.toast("SOS sent! Help is on the way.", icon="🆘")
+            st.error("SOS sent to HQ. Help is on the way.")
+            st.rerun()
+    with em2:
+        if st.button("🟢 Green", use_container_width=True):
             st.session_state.clearance_status = "PENDING"
             heartbeat()
-            send_msg("REQUEST", f"GREEN WAVE REQUEST from {st.session_state.driver_id} - Priority corridor clearance needed. Location: {st.session_state.gps_lat:.4f}, {st.session_state.gps_lon:.4f}")
-            st.toast("Green Wave requested. Awaiting HQ authorization.")
+            send_msg("REQUEST", f"GREEN WAVE REQUEST from {st.session_state.driver_id} - Location: {st.session_state.gps_lat:.4f}, {st.session_state.gps_lon:.4f}")
+            st.toast("Green Wave requested", icon="🟢")
+            st.rerun()
+    with em3:
+        if st.button("👤 Patient", use_container_width=True):
+            send_msg("STATUS", f"PATIENT SECURED - {st.session_state.driver_id} en route to {st.session_state.active_dst or 'destination'}")
+            st.toast("Status sent", icon="✅")
+            st.rerun()
+    with em4:
+        if st.button("🚧 Obstruction", use_container_width=True):
+            send_msg("WARNING", f"TRAFFIC OBSTRUCTION - {st.session_state.driver_id}. Requesting alternate route.")
+            st.toast("Reported", icon="⚠️")
             st.rerun()
     
-    with gw_cols[1]:
-        if st.button("Emergency preempt", use_container_width=True):
-            st.session_state.clearance_status = "PENDING"
-            heartbeat()
-            send_msg("REQUEST", f"⚠️ EMERGENCY PREEMPTION from {st.session_state.driver_id} - CRITICAL patient transport. Immediate signal clearance required!")
-            st.toast("Emergency preemption requested!")
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+    st.markdown("**⚠️ Report & share**")
+    rp1, rp2, rp3 = st.columns(3)
+    with rp1:
+        hazard_type = st.selectbox("Hazard type", ["ACCIDENT", "ROAD CLOSURE", "FLOODING", "DEBRIS", "SIGNAL", "OTHER"], label_visibility="collapsed", key="hazard_sel")
+    with rp2:
+        if st.button("⚠️ Report hazard", use_container_width=True, key="report_haz"):
+            try:
+                report_hazard(hazard_type)
+                send_msg("WARNING", f"HAZARD: {hazard_type} at ({st.session_state.gps_lat:.4f}, {st.session_state.gps_lon:.4f})")
+                st.toast(f"Hazard reported", icon="⚠️")
+            except Exception:
+                st.error("Failed to report")
+            st.rerun()
+    with rp3:
+        if st.button("📍 Share location", use_container_width=True):
+            send_msg("STATUS", f"LOCATION - {st.session_state.driver_id}: ({st.session_state.gps_lat:.4f}, {st.session_state.gps_lon:.4f})")
+            st.toast("Location shared!")
             st.rerun()
     
     if st.session_state.clearance_status == "PENDING":
         st.markdown("""
-        <div style="background:rgba(245,158,11,0.1); border:1px solid rgba(245,158,11,0.3); color:#f59e0b; padding:14px; border-radius:10px; text-align:center; margin:12px 0; font-size:13px;">
-            Green Wave request pending — Awaiting HQ authorization
+        <div style="background:rgba(255,0,255,0.08); border:1px solid rgba(255,0,255,0.4); border-radius:10px; color:#ff00ff; padding:10px; text-align:center; font-size:11px; font-family:JetBrains Mono,sans-serif; letter-spacing:1px;">
+            ● PENDING — Awaiting HQ
         </div>
         """, unsafe_allow_html=True)
     
     st.markdown("---")
+    st.markdown("**📬 Messages from HQ** (live 3s)")
     
-    st.markdown("#### Quick status")
-    
-    status_cols = st.columns([1, 1])
-    with status_cols[0]:
-        if st.button("Patient onboard", use_container_width=True):
-            send_msg("STATUS", f"PATIENT SECURED - {st.session_state.driver_id} en route to {st.session_state.active_dst or 'destination'}")
-        
-        if st.button("Traffic obstruction", use_container_width=True):
-            send_msg("WARNING", f"TRAFFIC OBSTRUCTION reported at current location by {st.session_state.driver_id}. Requesting alternate route.")
-    
-    with status_cols[1]:
-        if st.button("Low fuel alert", use_container_width=True):
-            send_msg("WARNING", f"LOW FUEL - {st.session_state.driver_id} fuel critical. May need to divert for refueling.")
-        
-        if st.button("Mechanical issue", use_container_width=True):
-            send_msg("WARNING", f"MECHANICAL ISSUE - {st.session_state.driver_id} experiencing vehicle problems. May need assistance.")
-    
-    st.markdown("---")
-    
-    st.markdown("#### Custom message")
-    with st.form("driver_msg_form"):
-        msg_priority = st.selectbox("Priority", ["NORMAL", "URGENT", "CRITICAL"])
-        custom_msg = st.text_area("Message", placeholder="Type your message to HQ...", height=80)
-        
-        if st.form_submit_button("Send to HQ", use_container_width=True):
-            if custom_msg:
-                status = "REQUEST" if msg_priority == "NORMAL" else "WARNING" if msg_priority == "URGENT" else "CRITICAL"
-                send_msg(status, f"[{msg_priority}] {st.session_state.driver_id}: {custom_msg}")
-                st.success("Message transmitted to HQ!")
-            else:
-                st.error("Please enter a message.")
-    
-    st.markdown("---")
-    
-    st.markdown("#### Hazard report")
-    st.markdown("""
-    <div style="background:linear-gradient(145deg,rgba(24,28,38,0.95),rgba(14,18,26,0.98)); border:1px solid rgba(255,255,255,0.06); border-radius:16px; padding:24px; margin-bottom:20px; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
-        <div style="display:flex; align-items:center; gap:10px; margin-bottom:16px;">
-            <span style="width:40px; height:40px; background:rgba(239,68,68,0.2); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:20px;">⚠️</span>
-            <div>
-                <div style="font-weight:600; color:#e6edf3; font-size:15px;">Report road hazard</div>
-                <div style="color:#6b7280; font-size:12px; margin-top:2px;">Alert HQ of incidents at your location</div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("<div style='color:#6b7280; font-size:12px; margin-bottom:8px;'>Select hazard type</div>", unsafe_allow_html=True)
-    hazard_type = st.selectbox("Hazard type", [
-        "ACCIDENT",
-        "ROAD CLOSURE",
-        "FLOODING",
-        "DEBRIS ON ROAD",
-        "SIGNAL MALFUNCTION",
-        "PEDESTRIAN HAZARD",
-        "CONSTRUCTION ZONE",
-        "OTHER"
-    ], label_visibility="collapsed")
-    
-    hazard_cols = st.columns([1, 1])
-    with hazard_cols[0]:
-        if st.button("⚠️ Report hazard", use_container_width=True):
-            try:
-                conn = sqlite3.connect(DB_FILE)
-                c = conn.cursor()
-                c.execute("INSERT INTO hazards (lat, lon, type, timestamp) VALUES (?, ?, ?, ?)",
-                          (st.session_state.gps_lat, st.session_state.gps_lon, f"{hazard_type}: Reported by {st.session_state.driver_id}", datetime.datetime.now()))
-                conn.commit()
-                conn.close()
-                send_msg("WARNING", f"HAZARD REPORTED: {hazard_type} at location ({st.session_state.gps_lat:.4f}, {st.session_state.gps_lon:.4f})")
-                st.toast(f"Hazard ({hazard_type}) reported successfully!", icon="⚠️")
-            except Exception:
-                st.error("Failed to report hazard")
-    
-    with hazard_cols[1]:
-        if st.button("📍 Share location", use_container_width=True):
-            send_msg("STATUS", f"LOCATION UPDATE - {st.session_state.driver_id}: ({st.session_state.gps_lat:.4f}, {st.session_state.gps_lon:.4f})")
-            st.toast("Location shared with HQ!")
-    
-    st.markdown("---")
-    
-    st.markdown("#### Messages from HQ")
-    
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        hq_msgs = pd.read_sql_query(
-            "SELECT * FROM driver_comms WHERE status LIKE 'HQ%' OR driver_id = 'ALL' OR driver_id = ? ORDER BY id DESC LIMIT 10",
-            conn,
-            params=(st.session_state.driver_id,)
-        )
-        conn.close()
-        
-        if not hq_msgs.empty:
-            for _, row in hq_msgs.iterrows():
-                msg_time = row.get('timestamp', '')
-                msg_text = row.get('message', '')
-                msg_type = row.get('status', '')
-                
-                if 'GREENWAVE' in msg_type:
-                    color = "#00ff9d"
-                    icon = "🟢"
-                elif 'ALERT' in msg_type:
-                    color = "#ff003c"
-                    icon = "🔴"
-                else:
-                    color = "#00f3ff"
-                    icon = "📡"
-                
-                st.markdown(f"""
-                <div style="background:#1a1a1a; border-left:3px solid {color}; padding:10px; margin-bottom:8px; border-radius:4px;">
-                    <div style="display:flex; justify-content:space-between;">
-                        <span style="color:{color}; font-weight:bold; font-size:11px;">{icon} HQ BROADCAST</span>
-                        <span style="color:#666; font-size:10px;">{msg_time}</span>
+    @st.fragment(run_every=3)
+    def _hq_messages_live():
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            hq_msgs = pd.read_sql_query(
+                "SELECT * FROM driver_comms WHERE status LIKE 'HQ%' OR driver_id = 'ALL' OR driver_id = ? ORDER BY id DESC LIMIT 10",
+                conn,
+                params=(st.session_state.driver_id,)
+            )
+            conn.close()
+            
+            if not hq_msgs.empty:
+                max_id = int(hq_msgs.iloc[0].get('id', 0) or 0)
+                if st.session_state.get("last_seen_hq_message_id", 0) == 0:
+                    st.session_state.last_seen_hq_message_id = max_id
+                for _, row in hq_msgs.iterrows():
+                    msg_time = row.get('timestamp', '')
+                    msg_text = row.get('message', '')
+                    msg_type = row.get('status', '')
+                    color = "#00ff9d" if 'GREENWAVE' in msg_type else "#ff003c" if 'ALERT' in msg_type else "#00f3ff"
+                    icon = "🟢" if 'GREENWAVE' in msg_type else "🔴" if 'ALERT' in msg_type else "📡"
+                    msg_esc = html.escape(str(msg_text))
+                    st.markdown(f"""
+                    <div style="background:rgba(8,8,16,0.7); border-left:4px solid {color}; padding:12px 14px; margin-bottom:8px; border-radius:10px; border:1px solid rgba(0,245,255,0.1);">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                            <span style="color:{color}; font-weight:700; font-size:11px;">{icon} HQ</span>
+                            <span style="color:rgba(0,245,255,0.4); font-size:10px;">{msg_time}</span>
+                        </div>
+                        <div style="color:#e8e8f0; font-size:13px; line-height:1.4;">{msg_esc}</div>
                     </div>
-                    <div style="color:#fff; font-size:12px; margin-top:5px;">{msg_text}</div>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.info("No messages from HQ yet.")
-    except Exception:
-        st.info("Unable to fetch HQ messages.")
+                    """, unsafe_allow_html=True)
+            else:
+                st.caption("No messages yet — popup + sound when HQ sends")
+        except Exception:
+            st.caption("Unable to load messages")
     
-    st.markdown("---")
-    st.markdown("""
-    <div style="background:linear-gradient(145deg,rgba(24,28,38,0.9),rgba(14,18,26,0.95)); padding:18px 20px; border-radius:14px; border:1px solid rgba(255,255,255,0.06); box-shadow:0 4px 16px rgba(0,0,0,0.3);">
-        <div style="color:#6b7280; font-size:11px; margin-bottom:12px;">V2X protocol</div>
-        <div style="display:flex; justify-content:space-between; color:#9ca3af; font-size:13px;">
-            <span>DSRC Active</span>
-            <span>5G-V2X Connected</span>
-            <span style="color:#10b981; font-weight:600;">&lt;50ms</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    _hq_messages_live()
+    
+    # Extra actions in expander (optional, when parked)
+    with st.expander("More actions (when parked)"):
+        if st.button("🔴 Emergency preempt", use_container_width=True, key="emerg_preempt"):
+            st.session_state.clearance_status = "PENDING"
+            heartbeat()
+            send_msg("REQUEST", f"⚠️ EMERGENCY PREEMPTION from {st.session_state.driver_id} - CRITICAL patient transport. Immediate signal clearance required!")
+            st.toast("Emergency preemption requested", icon="🔴")
+            st.rerun()
+        if st.button("⛽ Low fuel", use_container_width=True, key="low_fuel"):
+            send_msg("WARNING", f"LOW FUEL - {st.session_state.driver_id}")
+            st.toast("Alert sent", icon="⚠️")
+            st.rerun()
+        if st.button("🔧 Mechanical issue", use_container_width=True, key="mech"):
+            send_msg("WARNING", f"MECHANICAL - {st.session_state.driver_id}")
+            st.toast("Alert sent", icon="⚠️")
+            st.rerun()
+        with st.form("driver_msg_form"):
+            custom_msg = st.text_area("Custom message", placeholder="Type message...", height=60, key="custom_msg")
+            if st.form_submit_button("📤 Send"):
+                if custom_msg:
+                    send_msg("REQUEST", f"{st.session_state.driver_id}: {custom_msg}")
+                    st.toast("Sent", icon="✅")
+                    st.rerun()
+                else:
+                    st.error("Enter a message.")
 
 # ==========================================
 # TAB: STATS - Shift & Performance
@@ -1531,7 +1790,7 @@ with tab_stats:
         """, unsafe_allow_html=True)
     with stats_cols[2]:
         status_label = "En route" if st.session_state.status == "EN_ROUTE" else "Idle"
-        status_color = "#10b981" if st.session_state.status == "EN_ROUTE" else "#f59e0b"
+        status_color = "#00ff88" if st.session_state.status == "EN_ROUTE" else "#00f5ff"
         st.markdown(f"""
         <div class="widget-box">
             <div class="w-title">Status</div>
@@ -1561,66 +1820,71 @@ with tab_stats:
 # ==========================================
 with tab_alerts:
     st.markdown("### Nearby alerts")
+    st.caption("Updates automatically every 5 seconds.")
     
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        hazards = pd.read_sql_query(
-            "SELECT * FROM hazards ORDER BY id DESC LIMIT 15",
-            conn
-        )
-        conn.close()
-        
-        if not hazards.empty:
-            hazards["dist_km"] = hazards.apply(
-                lambda r: distance_km(st.session_state.gps_lat, st.session_state.gps_lon, r["lat"], r["lon"]),
-                axis=1
+    @st.fragment(run_every=5)
+    def _alerts_live():
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            hazards = pd.read_sql_query(
+                "SELECT * FROM hazards ORDER BY id DESC LIMIT 15",
+                conn
             )
-            hazards = hazards.sort_values("dist_km")
+            conn.close()
             
-            for _, h in hazards.head(8).iterrows():
-                dist = h.get("dist_km", 0)
-                if dist < 2:
-                    color = "#ef4444"
-                    badge = "CRITICAL"
-                elif dist < 5:
-                    color = "#f59e0b"
-                    badge = "NEARBY"
-                else:
-                    color = "#06b6d4"
-                    badge = "AHEAD"
-                h_type = str(h.get('type', 'Hazard'))[:60]
-                st.markdown(f"""
-                <div style="background:linear-gradient(145deg,rgba(24,28,38,0.95),rgba(14,18,26,0.98)); border-left:4px solid {color}; border-radius:14px; padding:18px; margin-bottom:14px; border:1px solid rgba(255,255,255,0.06); box-shadow:0 4px 16px rgba(0,0,0,0.3); display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
-                    <div style="display:flex; align-items:flex-start; gap:14px; flex:1; min-width:200px;">
-                        <span style="width:44px; height:44px; background:{color}22; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:22px; flex-shrink:0;">⚠️</span>
-                        <div>
-                            <div style="color:#e6edf3; font-weight:600; font-size:14px;">{h_type}</div>
-                            <div style="color:#6b7280; font-size:11px; margin-top:6px;">Reported by driver</div>
+            if not hazards.empty:
+                hazards["dist_km"] = hazards.apply(
+                    lambda r: distance_km(st.session_state.gps_lat, st.session_state.gps_lon, r["lat"], r["lon"]),
+                    axis=1
+                )
+                hazards = hazards.sort_values("dist_km")
+                
+                for _, h in hazards.head(8).iterrows():
+                    dist = h.get("dist_km", 0)
+                    if dist < 2:
+                        color = "#ff0050"
+                        badge = "CRITICAL"
+                    elif dist < 5:
+                        color = "#ff00ff"
+                        badge = "NEARBY"
+                    else:
+                        color = "#00f5ff"
+                        badge = "AHEAD"
+                    h_type = str(h.get('type', 'Hazard'))[:60]
+                    st.markdown(f"""
+                    <div style="background:rgba(8,8,16,0.7); backdrop-filter:blur(8px); border-left:4px solid {color}; border-radius:14px; padding:18px; margin-bottom:14px; border:1px solid rgba(0,245,255,0.15); display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+                        <div style="display:flex; align-items:flex-start; gap:14px; flex:1; min-width:200px;">
+                            <span style="width:44px; height:44px; background:{color}22; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:22px; flex-shrink:0;">⚠️</span>
+                            <div>
+                                <div style="color:#e8e8f0; font-weight:700; font-size:14px; font-family:Exo 2,sans-serif;">{h_type}</div>
+                                <div style="color:rgba(0,245,255,0.5); font-size:11px; margin-top:4px; font-family:JetBrains Mono,sans-serif;">Reported by driver</div>
+                            </div>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:10px; flex-shrink:0;">
+                            <span style="background:{color}33; color:{color}; padding:8px 14px; border-radius:10px; font-size:10px; font-weight:700; font-family:JetBrains Mono,sans-serif; letter-spacing:2px;">{badge}</span>
+                            <span style="color:{color}; font-weight:700; font-size:15px; font-family:JetBrains Mono,sans-serif;">{dist:.1f} km</span>
                         </div>
                     </div>
-                    <div style="display:flex; align-items:center; gap:10px; flex-shrink:0;">
-                        <span style="background:{color}33; color:{color}; padding:6px 12px; border-radius:8px; font-size:11px; font-weight:600;">{badge}</span>
-                        <span style="color:{color}; font-weight:600; font-size:15px;">{dist:.1f} km</span>
-                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div style="background:rgba(8,8,16,0.7); backdrop-filter:blur(12px); border:1px solid rgba(0,255,136,0.4); border-left:4px solid #00ff88; border-radius:16px; padding:36px; text-align:center; box-shadow:0 8px 32px rgba(0,0,0,0.4), 0 0 30px rgba(0,255,136,0.08);">
+                    <div style="font-size:44px; margin-bottom:14px;">✅</div>
+                    <div style="color:#00ff88; font-weight:700; font-size:18px; font-family:Orbitron,sans-serif; letter-spacing:3px;">NO HAZARDS NEARBY</div>
+                    <div style="color:rgba(0,245,255,0.6); font-size:14px; margin-top:8px; font-family:Exo 2,sans-serif;">Clear roads ahead</div>
                 </div>
                 """, unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div style="background:linear-gradient(145deg,rgba(16,185,129,0.1),rgba(16,185,129,0.02)); border:1px solid rgba(16,185,129,0.3); border-radius:16px; padding:32px; text-align:center; box-shadow:0 4px 20px rgba(16,185,129,0.1);">
-                <div style="font-size:40px; margin-bottom:12px;">✅</div>
-                <div style="color:#10b981; font-weight:600; font-size:16px;">No hazards nearby</div>
-                <div style="color:#6b7280; font-size:13px; margin-top:6px;">Clear roads ahead</div>
-            </div>
-            """, unsafe_allow_html=True)
-    except Exception:
-        st.info("Unable to fetch hazards.")
+        except Exception:
+            st.info("Unable to fetch hazards.")
+    
+    _alerts_live()
     
     st.markdown("---")
     st.markdown("#### Traffic status")
     st.markdown("""
-    <div style="background:rgba(20,24,32,0.8); border:1px solid rgba(255,255,255,0.05); border-radius:12px; padding:16px;">
-        <div style="color:#10b981; font-weight:600;">Live traffic</div>
-        <div style="color:#6b7280; font-size:12px; margin-top:6px;">Green Wave & V2X synced with HQ</div>
+    <div style="background:rgba(8,8,16,0.7); backdrop-filter:blur(8px); border:1px solid rgba(0,245,255,0.2); border-radius:16px; padding:20px; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+        <div style="color:#00ff88; font-weight:700; font-size:15px; font-family:Orbitron,sans-serif; letter-spacing:3px;">LIVE TRAFFIC</div>
+        <div style="color:rgba(0,245,255,0.6); font-size:13px; margin-top:8px; font-family:Exo 2,sans-serif;">Green Wave & V2X synced with HQ</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1646,19 +1910,24 @@ with tab_missions:
         conn.close()
         
         if not my_missions.empty:
-            for _, m in my_missions.iterrows():
+            for i, (_, m) in enumerate(my_missions.iterrows()):
                 status = m.get("status", "?")
-                status_color = "#00ff9d" if status == "COMPLETED" else "#ffcc00" if status == "ACCEPTED" else "#00f3ff"
+                status_color = "#00ff88" if status == "COMPLETED" else "#00f5ff" if status == "ACCEPTED" else "#ff00ff"
+                dst_name = m.get("destination", "?")
+                dst_coords = HOSPITALS.get(dst_name)
                 st.markdown(f"""
                 <div class="route-card" style="border-left-color:{status_color};">
-                    <div style="display:flex; justify-content:space-between;">
-                        <span style="color:#fff; font-weight:bold;">{m.get('mission_id', '?')}</span>
-                        <span style="color:{status_color}; font-size:11px;">{status}</span>
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="color:#e8e8f0; font-weight:700; font-family:JetBrains Mono,sans-serif;">{m.get('mission_id', '?')}</span>
+                        <span style="color:{status_color}; font-size:10px; font-family:JetBrains Mono,sans-serif; letter-spacing:2px;">{status}</span>
                     </div>
-                    <div style="color:#aaa; font-size:13px; margin-top:8px;">{m.get('origin','?')} → {m.get('destination','?')}</div>
-                    <div style="color:#666; font-size:10px; margin-top:5px;">{m.get('created_at','')}</div>
+                    <div style="color:rgba(0,245,255,0.7); font-size:14px; margin-top:10px; font-family:Exo 2,sans-serif;">{m.get('origin','?')} → {dst_name}</div>
+                    <div style="color:rgba(0,245,255,0.4); font-size:11px; margin-top:6px; font-family:JetBrains Mono,sans-serif;">{m.get('created_at','')}</div>
                 </div>
                 """, unsafe_allow_html=True)
+                if dst_coords and len(dst_coords) >= 2:
+                    nav_url = f"https://www.google.com/maps/dir/?api=1&destination={dst_coords[0]},{dst_coords[1]}&travelmode=driving"
+                    st.link_button("📍 Navigate", nav_url, key=f"nav_mission_{i}", use_container_width=True)
         else:
             st.info("No mission history yet. Accept a mission to get started!")
     except Exception:
@@ -1674,22 +1943,22 @@ with tab_settings:
     _prof = get_driver_profile(st.session_state.driver_id)
     if _prof:
         st.markdown(f"""
-        <div style="background:linear-gradient(145deg,rgba(24,28,38,0.95),rgba(14,18,26,0.98)); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:24px; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
-            <div style="color:#e6edf3; font-weight:600; font-size:18px;">{_prof.get('driver_id', st.session_state.driver_id)}</div>
-            <div style="color:#6b7280; font-size:13px; margin-top:2px;">{_prof.get('full_name') or '—'}</div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 24px; margin-top:16px; font-size:13px;">
-                <div><span style="color:#6b7280;">Vehicle</span><br><span style="color:#e6edf3;">{_prof.get('vehicle_id') or '—'}</span></div>
-                <div><span style="color:#6b7280;">Base</span><br><span style="color:#e6edf3;">{_prof.get('base_hospital') or '—'}</span></div>
-                <div><span style="color:#6b7280;">Phone</span><br><span style="color:#e6edf3;">{_prof.get('phone') or '—'}</span></div>
+        <div style="background:rgba(8,8,16,0.8); backdrop-filter:blur(12px); border:1px solid rgba(0,245,255,0.25); border-left:4px solid #00f5ff; border-radius:16px; padding:26px; box-shadow:0 8px 32px rgba(0,0,0,0.4), 0 0 30px rgba(0,245,255,0.06);">
+            <div style="color:#00f5ff; font-weight:700; font-size:22px; font-family:Orbitron,sans-serif; letter-spacing:4px;">{_prof.get('driver_id', st.session_state.driver_id)}</div>
+            <div style="color:rgba(0,245,255,0.7); font-size:14px; margin-top:6px; font-family:Exo 2,sans-serif;">{_prof.get('full_name') or '—'}</div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px 28px; margin-top:20px; font-size:14px; font-family:Exo 2,sans-serif;">
+                <div><span style="color:rgba(0,245,255,0.5); font-size:10px; font-family:JetBrains Mono,sans-serif;">VEHICLE</span><br><span style="color:#e8e8f0;">{_prof.get('vehicle_id') or '—'}</span></div>
+                <div><span style="color:rgba(0,245,255,0.5); font-size:10px; font-family:JetBrains Mono,sans-serif;">BASE</span><br><span style="color:#e8e8f0;">{_prof.get('base_hospital') or '—'}</span></div>
+                <div><span style="color:rgba(0,245,255,0.5); font-size:10px; font-family:JetBrains Mono,sans-serif;">PHONE</span><br><span style="color:#e8e8f0;">{_prof.get('phone') or '—'}</span></div>
             </div>
-            <div style="color:#10b981; font-size:12px; margin-top:14px; font-weight:500;">● Connected</div>
+            <div style="color:#00ff88; font-size:11px; margin-top:18px; font-weight:700; font-family:JetBrains Mono,sans-serif; letter-spacing:2px;">● CONNECTED</div>
         </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown(f"""
-        <div style="background:linear-gradient(145deg,rgba(24,28,38,0.95),rgba(14,18,26,0.98)); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:24px; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
-            <div style="color:#e6edf3; font-weight:600;">{st.session_state.driver_id}</div>
-            <div style="color:#10b981; font-size:12px; margin-top:8px;">● Connected</div>
+        <div style="background:rgba(8,8,16,0.8); backdrop-filter:blur(12px); border:1px solid rgba(0,245,255,0.25); border-left:4px solid #00f5ff; border-radius:16px; padding:26px; box-shadow:0 8px 32px rgba(0,0,0,0.4), 0 0 30px rgba(0,245,255,0.06);">
+            <div style="color:#00f5ff; font-weight:700; font-size:22px; font-family:Orbitron,sans-serif; letter-spacing:4px;">{st.session_state.driver_id}</div>
+            <div style="color:#00ff88; font-size:11px; margin-top:10px; font-weight:700; font-family:JetBrains Mono,sans-serif; letter-spacing:2px;">● CONNECTED</div>
         </div>
         """, unsafe_allow_html=True)
     
@@ -1702,16 +1971,24 @@ with tab_settings:
     
     st.markdown("---")
     st.markdown("#### Notifications")
-    notif_sound = st.toggle("Sound alerts for new missions", value=True)
-    notif_vibration = st.toggle("Vibration on mission alert", value=True)
+    notif_sound = st.toggle("🔊 Sound alerts for new missions & HQ messages", value=st.session_state.get("sounds_enabled", False), key="notif_sound")
+    if notif_sound != st.session_state.get("sounds_enabled"):
+        st.session_state.sounds_enabled = notif_sound
+        if notif_sound:
+            # st.audio does NOT support key parameter - omit it
+            st.audio(SOUND_MISSION, format="audio/mpeg", autoplay=True)
+            st.toast("Notification sounds enabled! You'll hear alerts for missions and HQ messages.", icon="🔊")
+        # Don't rerun immediately - lets the audio widget render and play
     
     st.markdown("---")
     st.markdown("#### Navigation")
-    nav_voice = st.toggle("Voice turn-by-turn", value=True)
-    nav_traffic = st.toggle("Live traffic updates", value=True)
+    st.caption("Voice turn-by-turn and live traffic updates — coming in future release")
     
     st.markdown("---")
     st.markdown("#### App info")
     st.markdown("""
-    <div style="color:#4b5563; font-size:12px; margin-top:20px;">TITAN Driver OS v52 • Connected to HQ</div>
+    <div style="color:rgba(0,245,255,0.6); font-size:13px; margin-top:24px; font-family:Exo 2,sans-serif;">
+        <span style="color:#00f5ff; font-weight:700; font-family:Orbitron,sans-serif;">TITAN DRIVER OS v52</span> - Real-time sync with HQ<br>
+        <span style="color:rgba(0,245,255,0.4); font-size:12px;">Missions, comms, location - all shared via HQ</span>
+    </div>
     """, unsafe_allow_html=True)

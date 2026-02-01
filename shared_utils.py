@@ -1,13 +1,39 @@
 """
 Shared TomTom routing utilities for App.py (HQ) and driverapp.py (Driver).
-Single source of truth for API calls and route alternatives.
+Single source of truth for API calls, route alternatives, and shared config.
 """
 import math
 import hashlib
+import os
 import requests
 
-TOMTOM_API_KEY = "EH7SOW12eDLJn2bR6UvfEbnpNvnrx8o4"
+TOMTOM_API_KEY = os.environ.get("TOMTOM_API_KEY", "EH7SOW12eDLJn2bR6UvfEbnpNvnrx8o4")
 BASE_URL = "https://api.tomtom.com/routing/1/calculateRoute"
+
+# Shared constants for both apps
+ONLINE_THRESHOLD_SEC = 60   # Driver considered online if last_seen within this
+MISSION_EXPIRY_SEC = 1800   # 30 min mission expiry
+
+# Single source of truth for hospital list (used by both App.py and driverapp.py)
+HOSPITALS = {
+    "Aster Medcity (Cheranallur)": [10.0575, 76.2652], "Amrita AIMS (Edappally)": [10.0326, 76.2997],
+    "Rajagiri Hospital (Aluva)": [10.0536, 76.3557], "Medical Trust Hospital (MG Road)": [9.9655, 76.2933],
+    "Lisie Hospital (Kaloor)": [9.9904, 76.2872], "General Hospital (Ernakulam)": [9.9734, 76.2818],
+    "VPS Lakeshore (Nettoor)": [9.9337, 76.3074], "Renai Medicity (Palarivattom)": [10.0076, 76.3053],
+    "Sunrise Hospital (Kakkanad)": [10.0069, 76.3308], "Apollo Adlux (Angamaly)": [10.1800, 76.3700],
+    "Lourdes Hospital (Pachalam)": [9.9980, 76.2920], "PVS Memorial (Kaloor)": [9.9940, 76.2900],
+    "Specialist Hospital (North)": [9.9920, 76.2880], "EMC (Palarivattom)": [10.0020, 76.3150],
+    "Kinder Hospital (Pathadipalam)": [10.0300, 76.3100], "Gautham Hospital (Panayappilly)": [9.9480, 76.2600],
+    "Sudheendra Medical Mission": [9.9700, 76.2850], "Krishna Hospital (MG Road)": [9.9680, 76.2900],
+    "Cochin Hospital": [9.9600, 76.2950], "Lakshmi Hospital": [9.9620, 76.2920],
+    "Welcare Hospital (Vyttila)": [9.9698, 76.3211], "Vijaya Hospital": [9.9550, 76.3000],
+    "Sree Sudheendra": [9.9750, 76.2800], "City Hospital": [9.9800, 76.2850],
+    "Silverline Hospital": [9.9750, 76.3200], "Kusumagiri Mental Health": [10.0200, 76.3400],
+    "MAJ Hospital (Edappally)": [10.0250, 76.3100], "Carmel Hospital (Aluva)": [10.1100, 76.3500],
+    "Najath Hospital (Aluva)": [10.1050, 76.3550], "Don Bosco Hospital": [10.0000, 76.2700],
+    "Mattancherry Hospital": [9.9500, 76.2500], "Fort Kochi Taluk Hospital": [9.9650, 76.2400],
+    "Samaritan Hospital": [10.1900, 76.3800], "Mom Hospital": [10.0150, 76.3100]
+}
 
 
 def _build_url(start, end, route_type="fastest", max_alternatives=0, instructions=True):

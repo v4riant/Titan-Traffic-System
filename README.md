@@ -4,26 +4,35 @@ Emergency vehicle fleet management & traffic intelligence system with HQ dashboa
 
 ## Quick Start
 
-### 1. Install Dependencies
+### 1. Create virtual environment (recommended)
+```bash
+cd Traffic-System
+python3 -m venv .venv
+source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+```
+
+### 2. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Run Both Apps
+### 3. Run Both Apps
 
 **Terminal 1 - HQ Dashboard:**
 ```bash
-streamlit run App.py --server.port 8501
+.venv/bin/streamlit run App.py --server.port 8501
 ```
+*(Or with venv activated: `streamlit run App.py --server.port 8501`)*
 
 **Terminal 2 - Driver App:**
 ```bash
-streamlit run driverapp.py --server.port 8502
+.venv/bin/streamlit run driverapp.py --server.port 8502
 ```
 
-**Or use the run script (Windows):**
+**Or use run scripts:**
 ```bash
-run.bat
+./run_server.sh    # Server on 8501
+./run_driver.sh    # Driver on 8502
 ```
 
 ### 3. Access

@@ -21,6 +21,30 @@ _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 from shared_utils import fetch_routes as shared_fetch_routes, distance_km, hash_password, verify_password, calculate_co2_savings, estimate_fuel_consumption
+try:
+    from shared_utils import HOSPITALS, ONLINE_THRESHOLD_SEC, MISSION_EXPIRY_SEC
+except ImportError:
+    ONLINE_THRESHOLD_SEC = 60
+    MISSION_EXPIRY_SEC = 1800
+    HOSPITALS = {
+        "Aster Medcity (Cheranallur)": [10.0575, 76.2652], "Amrita AIMS (Edappally)": [10.0326, 76.2997],
+        "Rajagiri Hospital (Aluva)": [10.0536, 76.3557], "Medical Trust Hospital (MG Road)": [9.9655, 76.2933],
+        "Lisie Hospital (Kaloor)": [9.9904, 76.2872], "General Hospital (Ernakulam)": [9.9734, 76.2818],
+        "VPS Lakeshore (Nettoor)": [9.9337, 76.3074], "Renai Medicity (Palarivattom)": [10.0076, 76.3053],
+        "Sunrise Hospital (Kakkanad)": [10.0069, 76.3308], "Apollo Adlux (Angamaly)": [10.1800, 76.3700],
+        "Lourdes Hospital (Pachalam)": [9.9980, 76.2920], "PVS Memorial (Kaloor)": [9.9940, 76.2900],
+        "Specialist Hospital (North)": [9.9920, 76.2880], "EMC (Palarivattom)": [10.0020, 76.3150],
+        "Kinder Hospital (Pathadipalam)": [10.0300, 76.3100], "Gautham Hospital (Panayappilly)": [9.9480, 76.2600],
+        "Sudheendra Medical Mission": [9.9700, 76.2850], "Krishna Hospital (MG Road)": [9.9680, 76.2900],
+        "Cochin Hospital": [9.9600, 76.2950], "Lakshmi Hospital": [9.9620, 76.2920],
+        "Welcare Hospital (Vyttila)": [9.9698, 76.3211], "Vijaya Hospital": [9.9550, 76.3000],
+        "Sree Sudheendra": [9.9750, 76.2800], "City Hospital": [9.9800, 76.2850],
+        "Silverline Hospital": [9.9750, 76.3200], "Kusumagiri Mental Health": [10.0200, 76.3400],
+        "MAJ Hospital (Edappally)": [10.0250, 76.3100], "Carmel Hospital (Aluva)": [10.1100, 76.3500],
+        "Najath Hospital (Aluva)": [10.1050, 76.3550], "Don Bosco Hospital": [10.0000, 76.2700],
+        "Mattancherry Hospital": [9.9500, 76.2500], "Fort Kochi Taluk Hospital": [9.9650, 76.2400],
+        "Samaritan Hospital": [10.1900, 76.3800], "Mom Hospital": [10.0150, 76.3100]
+    }
 
 try:
     from geopy.distance import geodesic
@@ -40,6 +64,7 @@ except Exception:
         class _D:
             def __init__(self, m):
                 self.meters = m
+                self.km = m / 1000.0
 
         return _D(meters)
 
@@ -60,8 +85,8 @@ if 'emergency_mode' not in st.session_state: st.session_state.emergency_mode = F
 if 'mission_id' not in st.session_state: st.session_state.mission_id = f"CMD-{random.randint(1000,9999)}"
 if 'priority_val' not in st.session_state: st.session_state.priority_val = "STANDARD"
 
-# API KEY & DB (same folder as script for shared DB when running from any cwd)
-TOMTOM_API_KEY = "EH7SOW12eDLJn2bR6UvfEbnpNvnrx8o4"
+# DB (same folder as script for shared DB when running from any cwd)
+# TomTom API key: shared_utils.TOMTOM_API_KEY (supports TOMTOM_API_KEY env var)
 DB_FILE = os.path.join(_APP_DIR, "titan_v52.db")
 
 # ==========================================
@@ -69,8 +94,8 @@ DB_FILE = os.path.join(_APP_DIR, "titan_v52.db")
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
-    # ENABLE WAL MODE for concurrent access (Prevent Locking)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
     c = conn.cursor()
     
     # 1. MISSION LOGS
@@ -223,6 +248,16 @@ def init_db():
             details TEXT
         )
     ''')
+    # mission_declines: persist driver declines so they don't see same mission after refresh
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS mission_declines (
+            mission_id TEXT,
+            driver_id TEXT,
+            declined_at DATETIME,
+            reason TEXT,
+            PRIMARY KEY (mission_id, driver_id)
+        )
+    ''')
     # Seed defaults (hashed passwords)
     c.execute(
         "INSERT OR IGNORE INTO operators (username, password, display_name) VALUES (?, ?, ?)",
@@ -230,7 +265,7 @@ def init_db():
     )
     c.execute(
         "INSERT OR IGNORE INTO driver_accounts (driver_id, username, password, full_name, created_at) VALUES (?, ?, ?, ?, ?)",
-        ("UNIT-07", "UNIT-07", hash_password("TITAN-DRIVER"), "Demo Driver", datetime.datetime.now()),
+        ("UNIT-07", "UNIT-07", hash_password("TITAN-DRIVER"), "Unit 7", datetime.datetime.now()),
     )
     
     conn.commit()
@@ -372,8 +407,10 @@ def get_driver_from_drivers_table(driver_id):
         pass
     return None
 
-def get_available_drivers(online_within_seconds=90):
-    """Drivers who are ONLINE (recent last_seen) and have a registered account. No phantom/random units."""
+def get_available_drivers(online_within_seconds=None):
+    """Drivers who are ONLINE (recent last_seen), ACTIVE (not BREAK/INACTIVE), and have a REGISTERED account."""
+    if online_within_seconds is None:
+        online_within_seconds = ONLINE_THRESHOLD_SEC
     try:
         conn = sqlite3.connect(DB_FILE)
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -381,6 +418,7 @@ def get_available_drivers(online_within_seconds=90):
             SELECT d.* FROM drivers d
             INNER JOIN driver_accounts a ON d.driver_id = a.driver_id
             WHERE d.current_lat IS NOT NULL AND d.current_lon IS NOT NULL
+              AND (d.status IS NULL OR d.status NOT IN ('BREAK', 'INACTIVE'))
         """, conn)
         conn.close()
         if df.empty:
@@ -397,6 +435,46 @@ def get_available_drivers(online_within_seconds=90):
 def get_all_active_drivers(online_within_seconds=30):
     """All drivers visible to server for global map and Live Metrics."""
     return get_available_drivers(online_within_seconds=online_within_seconds)
+
+
+def get_drivers_for_live_map(online_within_seconds=60):
+    """Drivers for Live Tracking map: includes those without position (simulated). Returns df with current_lat, current_lon, status, etc."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        df = pd.read_sql_query("""
+            SELECT d.driver_id, d.status, d.current_lat, d.current_lon, d.origin, d.destination, d.speed, d.last_seen, d.active_mission_id
+            FROM drivers d INNER JOIN driver_accounts a ON d.driver_id = a.driver_id
+        """, conn)
+        conn.close()
+        if df.empty:
+            return pd.DataFrame()
+        cutoff = datetime.datetime.now() - datetime.timedelta(seconds=online_within_seconds)
+        df["last_seen"] = pd.to_datetime(df["last_seen"], errors="coerce")
+        df = df[df["last_seen"] >= cutoff]
+        if df.empty:
+            return pd.DataFrame()
+        # Simulate position when lat/lon is null (no real-time GPS) - linear interpolation along route
+        def _simulate_position(row):
+            lat, lon = row.get("current_lat"), row.get("current_lon")
+            if pd.notna(lat) and pd.notna(lon):
+                return float(lat), float(lon)
+            status = row.get("status", "IDLE")
+            org_key, dst_key = row.get("origin"), row.get("destination")
+            if status == "EN_ROUTE" and org_key and dst_key and org_key in HOSPITALS and dst_key in HOSPITALS:
+                o, d = HOSPITALS[org_key], HOSPITALS[dst_key]
+                t = 0.4
+                return float(o[0] + t * (d[0] - o[0])), float(o[1] + t * (d[1] - o[1]))
+            if org_key and org_key in HOSPITALS:
+                c = HOSPITALS[org_key]
+                return float(c[0]), float(c[1])
+            return 10.015, 76.340
+        pos = df.apply(_simulate_position, axis=1)
+        df["current_lat"] = [p[0] for p in pos]
+        df["current_lon"] = [p[1] for p in pos]
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 def get_drivers_pending_clearance():
@@ -443,6 +521,24 @@ def update_driver_clearance(driver_id, status):
         return True
     except Exception:
         return False
+
+def mission_id_exists(mid):
+    """Check if mission_id already exists."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute("SELECT 1 FROM missions WHERE mission_id=?", (mid,)).fetchone()
+        conn.close()
+        return row is not None
+    except Exception:
+        return False
+
+def generate_unique_mission_id():
+    """Generate a mission ID that does not already exist."""
+    for _ in range(10):
+        mid = f"CMD-{int(time.time())}-{random.randint(100,999)}"
+        if not mission_id_exists(mid):
+            return mid
+    return f"CMD-{int(time.time())}-{random.randint(1000,9999)}"
 
 def create_mission(mid, org, dst, prio, assigned_driver_id=None, notes=None):
     try:
@@ -497,6 +593,20 @@ def update_mission_assignment(mission_id, assigned_driver_id):
     except Exception:
         return False
 
+def get_mission_details(mission_id):
+    """Get assigned_driver_id, origin, destination for a mission. Returns dict or None."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            row = conn.execute(
+                "SELECT assigned_driver_id, origin, destination FROM missions WHERE mission_id=?",
+                (mission_id,)
+            ).fetchone()
+        if row:
+            return {"assigned_driver_id": row[0], "origin": row[1], "destination": row[2]}
+    except Exception:
+        pass
+    return None
+
 def update_mission_status(mission_id, status):
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -508,22 +618,93 @@ def update_mission_status(mission_id, status):
     except Exception:
         return False
 
+def mark_expired_missions():
+    """Mark DISPATCHED missions as EXPIRED when past MISSION_EXPIRY_SEC. Returns count marked."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        cutoff = (datetime.datetime.now() - datetime.timedelta(seconds=MISSION_EXPIRY_SEC)).isoformat()
+        c.execute(
+            "UPDATE missions SET status='EXPIRED' WHERE status='DISPATCHED' AND created_at < ?",
+            (cutoff,),
+        )
+        n = c.rowcount
+        conn.commit()
+        conn.close()
+        return n
+    except Exception:
+        return 0
+
+def get_driver_offline_alerts(offline_seconds=150):
+    """Missions where assigned driver has last_seen > offline_seconds ago. Returns list of {mission_id, driver_id, seen_ago}."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cutoff = (datetime.datetime.now() - datetime.timedelta(seconds=offline_seconds)).isoformat()
+        rows = conn.execute("""
+            SELECT m.mission_id, m.assigned_driver_id, d.last_seen
+            FROM missions m
+            INNER JOIN drivers d ON m.assigned_driver_id = d.driver_id
+            WHERE m.status = 'ACCEPTED' AND d.last_seen < ?
+        """, (cutoff,)).fetchall()
+        conn.close()
+        now = datetime.datetime.now()
+        alerts = []
+        for r in rows:
+            mid, did, last = r[0], r[1], r[2]
+            if last:
+                try:
+                    last_dt = pd.to_datetime(last, errors="coerce")
+                    if pd.notna(last_dt):
+                        seen_ago = int((now - last_dt).total_seconds())
+                        alerts.append({"mission_id": mid, "driver_id": did, "seen_ago": seen_ago})
+                except Exception:
+                    pass
+        return alerts
+    except Exception:
+        return []
+
 # ==========================================
 # V2X COMMUNICATIONS FUNCTIONS
 # ==========================================
-def get_driver_comms(limit=100):
-    """Get all driver communications/messages"""
+def get_driver_comms(limit=100, driver_id=None, conversation_mode=False):
+    """
+    Get driver communications.
+    - driver_id=None: all messages
+    - driver_id="UNIT-07": filter by unit
+      - conversation_mode=False: only messages FROM that driver
+      - conversation_mode=True: messages from driver + messages TO that driver (HQ msgs where recipient=driver_id or 'ALL')
+    """
     try:
         conn = sqlite3.connect(DB_FILE)
-        df = pd.read_sql_query(
-            "SELECT * FROM driver_comms ORDER BY id DESC LIMIT ?",
-            conn,
-            params=(limit,),
-        )
+        if driver_id is None:
+            df = pd.read_sql_query("SELECT * FROM driver_comms ORDER BY id DESC LIMIT ?", conn, params=(limit,))
+        elif conversation_mode:
+            df = pd.read_sql_query("""
+                SELECT * FROM driver_comms
+                WHERE (status NOT LIKE 'HQ%%' AND driver_id=?) OR (status LIKE 'HQ%%' AND (driver_id=? OR driver_id='ALL'))
+                ORDER BY id DESC LIMIT ?
+            """, conn, params=(driver_id, driver_id, limit))
+        else:
+            df = pd.read_sql_query(
+                "SELECT * FROM driver_comms WHERE driver_id=? AND status NOT LIKE 'HQ%%' ORDER BY id DESC LIMIT ?",
+                conn, params=(driver_id, limit),
+            )
         conn.close()
         return df
     except Exception:
         return pd.DataFrame()
+
+def get_driver_ids_with_messages():
+    """Driver IDs who have sent messages (for unit filter dropdown)."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        rows = conn.execute(
+            "SELECT DISTINCT driver_id FROM driver_comms WHERE status NOT LIKE 'HQ%%' ORDER BY driver_id"
+        ).fetchall()
+        conn.close()
+        return [r[0] for r in rows if r[0]]
+    except Exception:
+        return []
 
 def send_hq_message(driver_id, message, msg_type="HQ_BROADCAST"):
     """Send a message from HQ to driver"""
@@ -798,27 +979,8 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 3. DATA LAYER
+# 3. DATA LAYER (HOSPITALS from shared_utils)
 # ==========================================
-HOSPITALS = {
-    "Aster Medcity (Cheranallur)": [10.0575, 76.2652], "Amrita AIMS (Edappally)": [10.0326, 76.2997],
-    "Rajagiri Hospital (Aluva)": [10.0536, 76.3557], "Medical Trust Hospital (MG Road)": [9.9655, 76.2933],
-    "Lisie Hospital (Kaloor)": [9.9904, 76.2872], "General Hospital (Ernakulam)": [9.9734, 76.2818],
-    "VPS Lakeshore (Nettoor)": [9.9337, 76.3074], "Renai Medicity (Palarivattom)": [10.0076, 76.3053],
-    "Sunrise Hospital (Kakkanad)": [10.0069, 76.3308], "Apollo Adlux (Angamaly)": [10.1800, 76.3700],
-    "Lourdes Hospital (Pachalam)": [9.9980, 76.2920], "PVS Memorial (Kaloor)": [9.9940, 76.2900],
-    "Specialist Hospital (North)": [9.9920, 76.2880], "EMC (Palarivattom)": [10.0020, 76.3150],
-    "Kinder Hospital (Pathadipalam)": [10.0300, 76.3100], "Gautham Hospital (Panayappilly)": [9.9480, 76.2600],
-    "Sudheendra Medical Mission": [9.9700, 76.2850], "Krishna Hospital (MG Road)": [9.9680, 76.2900],
-    "Cochin Hospital": [9.9600, 76.2950], "Lakshmi Hospital": [9.9620, 76.2920],
-    "Welcare Hospital (Vyttila)": [9.9698, 76.3211], "Vijaya Hospital": [9.9550, 76.3000],
-    "Sree Sudheendra": [9.9750, 76.2800], "City Hospital": [9.9800, 76.2850],
-    "Silverline Hospital": [9.9750, 76.3200], "Kusumagiri Mental Health": [10.0200, 76.3400],
-    "MAJ Hospital (Edappally)": [10.0250, 76.3100], "Carmel Hospital (Aluva)": [10.1100, 76.3500],
-    "Najath Hospital (Aluva)": [10.1050, 76.3550], "Don Bosco Hospital": [10.0000, 76.2700],
-    "Mattancherry Hospital": [9.9500, 76.2500], "Fort Kochi Taluk Hospital": [9.9650, 76.2400],
-    "Samaritan Hospital": [10.1900, 76.3800], "Mom Hospital": [10.0150, 76.3100]
-}
 
 SENSORS_GRID = {
     "Edappally Toll": (10.0261, 76.3085), "Palarivattom Junc": (10.0033, 76.3063),
@@ -960,15 +1122,26 @@ def _safe_html(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 def render_live_tracking_map(active_org, active_dst, prio_factor, focus_driver_id=None):
-    """Live map with optional focus on one driver (route + ghost trail). Ambulance markers show driver name, vehicle, unit, from/to."""
+    """Live map: ambulance drivers' live location, status, ghost trail. Simulates position when no real-time GPS."""
     drv_live = get_driver_from_drivers_table(focus_driver_id) if focus_driver_id else None
     driver = get_driver_status_by_id(focus_driver_id) if focus_driver_id and not drv_live else (drv_live or (get_driver_status() if not focus_driver_id else None))
     if drv_live and not driver:
         driver = drv_live
-    all_drivers = get_all_active_drivers(60)
+    all_drivers = get_drivers_for_live_map(60)
     profiles = get_driver_profiles(all_drivers["driver_id"].tolist() if not all_drivers.empty else [])
     hazards = get_hazards()
     ghost_trail = get_ghost_trail_for_driver(focus_driver_id, 50) if focus_driver_id else []
+    if focus_driver_id and len(ghost_trail) < 2:
+        mission = get_current_mission_for_driver(focus_driver_id)
+        drv = get_driver_from_drivers_table(focus_driver_id)
+        org_key = (drv or {}).get("origin") or (mission or {}).get("origin")
+        dst_key = (drv or {}).get("dest") or (drv or {}).get("destination") or (mission or {}).get("destination")
+        if org_key and dst_key and org_key in HOSPITALS and dst_key in HOSPITALS:
+            routes = fetch_routes(HOSPITALS[org_key], HOSPITALS[dst_key], prio_factor)
+            if routes and routes[0].get("coords"):
+                coords = routes[0]["coords"]
+                idx = min(int(len(coords) * 0.4), len(coords) - 1)
+                ghost_trail = coords[: idx + 1]
     sensors = get_sensors_data()
     
     map_center = [10.015, 76.340]
@@ -982,6 +1155,12 @@ def render_live_tracking_map(active_org, active_dst, prio_factor, focus_driver_i
     elif active_org:
         map_center = list(active_org) if hasattr(active_org, "__iter__") else active_org
         zoom = 13
+    elif not all_drivers.empty:
+        try:
+            map_center = [float(all_drivers.iloc[0]["current_lat"]), float(all_drivers.iloc[0]["current_lon"])]
+            zoom = 13
+        except (TypeError, ValueError, KeyError):
+            pass
     
     m = folium.Map(location=map_center, zoom_start=zoom, tiles="CartoDB dark_matter")
     
@@ -995,7 +1174,8 @@ def render_live_tracking_map(active_org, active_dst, prio_factor, focus_driver_i
     
     for _, row in all_drivers.iterrows():
         lat, lon = row.get("current_lat"), row.get("current_lon")
-        if pd.isna(lat) or pd.isna(lon): continue
+        if pd.isna(lat) or pd.isna(lon):
+            continue
         did = row.get("driver_id", "?")
         status = row.get("status", "?")
         speed = row.get("speed")
@@ -1193,6 +1373,10 @@ def render_login():
 
 # --- DASHBOARD PAGE ---
 def render_dashboard():
+    # Mark expired missions on each load
+    n_expired = mark_expired_missions()
+    if n_expired > 0:
+        log_activity("EXPIRED", "SYSTEM", f"{n_expired} mission(s) auto-expired (no accept within {MISSION_EXPIRY_SEC//60} min)")
     with st.sidebar:
         st.image("https://cdn-icons-png.flaticon.com/512/3662/3662817.png", width=60)
         st.markdown(f"### TRAFFIC INTEL")
@@ -1228,13 +1412,18 @@ def render_dashboard():
             
             assigned_driver = st.selectbox("Assign to Driver", options=driver_opts)
             if st.form_submit_button("🚨 DISPATCH", use_container_width=True):
-                mid = f"CMD-{random.randint(1000,9999)}"
-                save_mission_data(mid, org, dst, prio_label, 0, 0, 0)
-                drv_id = None
-                if assigned_driver != "AUTO / ANY AVAILABLE":
-                    drv_id = assigned_driver.split(" ")[0] if " " in assigned_driver else assigned_driver
-                create_mission(mid, org, dst, prio_label, assigned_driver_id=drv_id)
-                st.success(f"Mission {mid} dispatched!")
+                if org == dst:
+                    st.error("Origin and destination must be different.")
+                else:
+                    mid = generate_unique_mission_id()
+                    save_mission_data(mid, org, dst, prio_label, 0, 0, 0)
+                    drv_id = None
+                    if assigned_driver != "AUTO / ANY AVAILABLE":
+                        drv_id = assigned_driver.split(" ")[0] if " " in assigned_driver else assigned_driver
+                    create_mission(mid, org, dst, prio_label, assigned_driver_id=drv_id)
+                    target = str(drv_id) if drv_id else "ALL"
+                    send_hq_message(target, f"🚨 NEW MISSION {mid}: {org} → {dst}. Mission will appear automatically.", "HQ_DISPATCH")
+                    st.success(f"Mission {mid} dispatched!")
         
         st.markdown("---")
         st.markdown("### 👥 DRIVER AVAILABILITY")
@@ -1242,22 +1431,20 @@ def render_dashboard():
         if drivers_df.empty:
             st.caption("No online drivers detected yet. Open `driverapp.py` to bring a unit online.")
         else:
-            now = datetime.datetime.now()
-            tmp = drivers_df.copy()
-            tmp["last_seen"] = pd.to_datetime(tmp["last_seen"], errors="coerce")
-            tmp["seen_s_ago"] = (now - tmp["last_seen"]).dt.total_seconds().fillna(999999).astype(int)
-            st.dataframe(tmp[["driver_id", "status", "seen_s_ago", "current_lat", "current_lon"]], use_container_width=True, height=220)
+            disp_cols = [c for c in ["driver_id", "status", "current_lat", "current_lon"] if c in drivers_df.columns]
+            st.dataframe(drivers_df[disp_cols] if disp_cols else drivers_df, use_container_width=True, height=220)
         
         st.markdown("---")
         if st.button("🎬 DEMO MODE", use_container_width=True, help="Create sample missions for demo"):
             try:
                 hospitals = sorted(list(HOSPITALS.keys()))
                 for i in range(3):
-                    mid = f"CMD-{random.randint(1000,9999)}"
+                    mid = generate_unique_mission_id()
                     org = random.choice(hospitals)
                     dst = random.choice([h for h in hospitals if h != org])
                     prio = random.choice(["STANDARD", "MEDIUM", "HIGH"])
                     create_mission(mid, org, dst, prio, assigned_driver_id=None, notes=f"Demo mission {i+1}")
+                    send_hq_message("ALL", f"🚨 NEW MISSION {mid}: {org} → {dst}. Mission will appear automatically.", "HQ_DISPATCH")
                 st.success("3 demo missions created! Check Mission Center.")
                 st.balloons()
                 st.rerun()
@@ -1266,6 +1453,30 @@ def render_dashboard():
         if st.button("🔒 LOGOUT", use_container_width=True): st.session_state.authenticated = False; st.session_state.page = 'home'; st.rerun()
 
     if st.session_state.emergency_mode: st.markdown(f'''<div style="background:{primary}22; border:1px solid {primary}; color:{primary}; padding:10px; text-align:center; font-family:'Orbitron'; letter-spacing:3px; margin-bottom:20px; border-radius:6px;">⚠️ CRITICAL EMERGENCY PROTOCOL ACTIVE ⚠️</div>''', unsafe_allow_html=True)
+
+    # Driver online detection - popup when driver comes online
+    if 'last_known_online_drivers' not in st.session_state:
+        st.session_state.last_known_online_drivers = set()
+    @st.fragment(run_every=5)
+    def _driver_online_detector():
+        try:
+            drivers_df = get_available_drivers()
+            if drivers_df.empty or "driver_id" not in drivers_df.columns:
+                current_ids = set()
+            else:
+                current_ids = set(drivers_df["driver_id"].astype(str).tolist())
+            last = st.session_state.last_known_online_drivers
+            if last and current_ids:
+                new_drivers = current_ids - last
+                if new_drivers:
+                    profiles = get_driver_profiles(list(new_drivers))
+                    for did in new_drivers:
+                        prof = profiles.get(did, {})
+                        name = prof.get("full_name") or did
+                        st.toast(f"🟢 {name} ({did}) is now ONLINE", icon="🚑")
+            st.session_state.last_known_online_drivers = current_ids
+        except Exception:
+            pass
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🚀 MISSION CENTER",
@@ -1292,22 +1503,25 @@ def render_dashboard():
             st.markdown("""
             <div class="titan-card" style="border-left:4px solid #00f3ff; padding:16px; margin-bottom:16px;">
                 <div style="font-size:18px; font-weight:600; margin:4px 0;">📍 Define Mission</div>
-                <div style="font-size:12px; color:#888;">Select origin and destination</div>
+                <div style="font-size:12px; color:#888;">Select origin and destination — ETA & routes auto-load</div>
             </div>
             """, unsafe_allow_html=True)
-            with st.form("mission_center_form"):
-                org = st.selectbox("ORIGIN (Pickup)", sorted(list(HOSPITALS.keys())), key="mc_org")
-                dst = st.selectbox("DESTINATION (Drop-off)", sorted(list(HOSPITALS.keys())), key="mc_dst")
-                prio_label = st.select_slider("Priority", options=["STANDARD", "MEDIUM", "HIGH", "CRITICAL"], value="STANDARD", key="mc_prio")
-                prio_factor = {"STANDARD": 1.0, "MEDIUM": 0.85, "HIGH": 0.75, "CRITICAL": 0.65}[prio_label]
-                
-                if st.form_submit_button("🔍 FETCH ROUTES", use_container_width=True):
+            org = st.selectbox("ORIGIN (Pickup)", sorted(list(HOSPITALS.keys())), key="mc_org")
+            dst = st.selectbox("DESTINATION (Drop-off)", sorted(list(HOSPITALS.keys())), key="mc_dst")
+            prio_label = st.select_slider("Priority", options=["STANDARD", "MEDIUM", "HIGH", "CRITICAL"], value="STANDARD", key="mc_prio")
+            prio_factor = {"STANDARD": 1.0, "MEDIUM": 0.85, "HIGH": 0.75, "CRITICAL": 0.65}[prio_label]
+            # Auto-fetch routes when origin & destination selected (show ETA + alternatives on first page)
+            fetch_key = (org, dst, prio_label)
+            if org != dst and org in HOSPITALS and dst in HOSPITALS:
+                if st.session_state.get("mc_fetch_key") != fetch_key:
                     with st.spinner("Loading routes..."):
                         st.session_state.mc_routes = fetch_routes(HOSPITALS[org], HOSPITALS[dst], prio_factor)
-                    st.session_state.mc_submitted_org = org
-                    st.session_state.mc_submitted_dst = dst
-                    st.session_state.mc_submitted_prio = prio_label
-                    st.rerun()
+                    st.session_state.mc_fetch_key = fetch_key
+                st.session_state.mc_submitted_org = org
+                st.session_state.mc_submitted_dst = dst
+                st.session_state.mc_submitted_prio = prio_label
+            else:
+                st.session_state.mc_fetch_key = None
         
         with mc_col2:
             st.markdown("""
@@ -1316,28 +1530,34 @@ def render_dashboard():
                 <div style="font-size:12px; color:#888;">Sorted by proximity to origin</div>
             </div>
             """, unsafe_allow_html=True)
-            drivers_df = get_available_drivers(60)
-            org_key = st.session_state.get("mc_submitted_org") or list(HOSPITALS.keys())[0]
+            drivers_df = get_available_drivers()
+            org_key = st.session_state.get("mc_submitted_org") or org or list(HOSPITALS.keys())[0]
             org_coords = HOSPITALS.get(org_key)
             
             if drivers_df.empty:
                 st.info("No online drivers. Open driverapp to bring units online.")
                 driver_proximity = []
             else:
+                profiles = get_driver_profiles(drivers_df["driver_id"].tolist())
                 driver_proximity = []
                 for _, row in drivers_df.iterrows():
+                    did = row.get("driver_id", "?")
                     lat, lon = row.get("current_lat"), row.get("current_lon")
+                    prof = profiles.get(did, {})
+                    full_name = prof.get("full_name") or did
                     if pd.notna(lat) and pd.notna(lon) and org_coords:
                         dist = distance_km(org_coords[0], org_coords[1], float(lat), float(lon))
                         driver_proximity.append({
-                            "driver_id": row.get("driver_id", "?"),
+                            "driver_id": did,
+                            "full_name": full_name,
                             "status": row.get("status", "?"),
                             "distance_km": dist,
                             "lat": lat, "lon": lon
                         })
                     else:
                         driver_proximity.append({
-                            "driver_id": row.get("driver_id", "?"),
+                            "driver_id": did,
+                            "full_name": full_name,
                             "status": row.get("status", "?"),
                             "distance_km": 999,
                             "lat": None, "lon": None
@@ -1350,10 +1570,10 @@ def render_dashboard():
                     st.markdown(f"""
                     <div class="titan-card" style="border-left-color:{color}; padding:14px; margin-bottom:8px;">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <span style="font-weight:bold; color:{color};">{d['driver_id']}</span>
+                            <span style="font-weight:bold; color:{color};">{d['full_name']}</span>
                             <span style="font-size:11px; padding:2px 8px; border-radius:4px; background:{color}22; color:{color};">{d['status']}</span>
                         </div>
-                        <div style="font-size:12px; color:#aaa; margin-top:4px;">📍 {dist_str} km from origin</div>
+                        <div style="font-size:11px; color:#6b7280;">{d['driver_id']} • 📍 {dist_str} km from origin</div>
                     </div>
                     """, unsafe_allow_html=True)
         
@@ -1385,6 +1605,21 @@ def render_dashboard():
                     </div>
                     """, unsafe_allow_html=True)
             
+            # Map with alternate routes + ETA on Mission Center (first page)
+            st.markdown("**🗺️ Route map with alternatives**")
+            org_coords = HOSPITALS.get(org, [10.015, 76.34])
+            dst_coords = HOSPITALS.get(dst, [10.015, 76.34])
+            mc_map = folium.Map(location=org_coords, zoom_start=12, tiles="CartoDB dark_matter")
+            c_codes = ["#ff003c", "#00f3ff", "#ffcc00", "#00ff9d"]
+            for i, route in enumerate(mc_routes[:4]):
+                coords = route.get("coords", [])
+                if coords:
+                    folium.PolyLine(coords, color=c_codes[i % len(c_codes)], weight=5 if i == 0 else 3, opacity=0.9 if i == 0 else 0.6).add_to(mc_map)
+            folium.Marker(org_coords, icon=folium.Icon(color="blue", icon="play", prefix="fa"), popup=f"<b>📍 ORIGIN</b><br>{org}").add_to(mc_map)
+            folium.Marker(dst_coords, icon=folium.Icon(color="red", icon="flag-checkered", prefix="fa"), popup=f"<b>🏁 DESTINATION</b><br>{dst}").add_to(mc_map)
+            st_folium(mc_map, width="100%", height=400, returned_objects=[])
+            st.caption(f"Best ETA: {mc_routes[0].get('eta', 0)} min • {mc_routes[0].get('dist', 0)} km — {mc_routes[0].get('route_type', 'Fastest')}")
+            
             st.markdown("---")
             st.markdown("""
             <div class="titan-card" style="border-left:4px solid #ff003c; padding:16px; margin:16px 0;">
@@ -1410,28 +1645,31 @@ def render_dashboard():
                 notes = st.text_input("Mission Notes (optional)", placeholder="e.g. Patient type, special instructions...")
                 
                 if st.form_submit_button("🚨 DISPATCH MISSION", use_container_width=True):
-                    mid = f"CMD-{random.randint(1000,9999)}"
                     org_d = st.session_state.get("mc_submitted_org") or list(HOSPITALS.keys())[0]
                     dst_d = st.session_state.get("mc_submitted_dst") or list(HOSPITALS.keys())[1]
-                    prio_d = st.session_state.get("mc_submitted_prio") or "STANDARD"
-                    
-                    driver_id = None if assigned_driver == "AUTO (Closest IDLE)" else assigned_driver
-                    if driver_id is None and idle_drivers:
-                        driver_id = idle_drivers[0]
-                    
-                    save_mission_data(mid, org_d, dst_d, prio_d, 0, 0, 0)
-                    create_mission(mid, org_d, dst_d, prio_d, assigned_driver_id=driver_id, notes=notes or "")
-                    log_activity("DISPATCH", st.session_state.get("operator_id", "HQ"), f"{mid} {org_d}→{dst_d} to {driver_id or 'AUTO'}")
-                    
-                    if notes:
-                        send_hq_message(driver_id or "ALL", f"Mission {mid}: {notes}", "HQ_INFO")
-                    
-                    st.success(f"✅ Mission {mid} dispatched! Assigned to {driver_id or 'AUTO'}")
-                    st.balloons()
-                    st.session_state.mc_routes = None
-                    st.rerun()
+                    if org_d == dst_d:
+                        st.error("Origin and destination must be different.")
+                    else:
+                        mid = generate_unique_mission_id()
+                        prio_d = st.session_state.get("mc_submitted_prio") or "STANDARD"
+                        driver_id = None if assigned_driver == "AUTO (Closest IDLE)" else assigned_driver
+                        if driver_id is None and idle_drivers:
+                            driver_id = idle_drivers[0]
+                        save_mission_data(mid, org_d, dst_d, prio_d, 0, 0, 0)
+                        create_mission(mid, org_d, dst_d, prio_d, assigned_driver_id=driver_id, notes=notes or "")
+                        log_activity("DISPATCH", st.session_state.get("operator_id", "HQ"), f"{mid} {org_d}→{dst_d} to {driver_id or 'AUTO'}")
+                        target = str(driver_id) if driver_id else "ALL"
+                        dispatch_msg = f"🚨 NEW MISSION {mid}: {org_d} → {dst_d}. "
+                        if notes:
+                            dispatch_msg += f"Notes: {notes}. "
+                        dispatch_msg += "Mission will appear automatically."
+                        send_hq_message(target, dispatch_msg, "HQ_DISPATCH")
+                        st.success(f"✅ Mission {mid} dispatched! Assigned to {driver_id or 'AUTO'}")
+                        st.balloons()
+                        st.session_state.mc_routes = None
+                        st.rerun()
         else:
-            st.info("👆 Select origin & destination, then click **FETCH ROUTES** to preview and dispatch.")
+            st.info("👆 Select origin & destination (different locations) to see ETA and route alternatives.")
 
     with tab2:
         # ==========================================
@@ -1439,6 +1677,17 @@ def render_dashboard():
         # ==========================================
         st.markdown("## 🗺️ LIVE TRACKING & MAP")
         st.markdown("---")
+        
+        # --- Driver offline alerts (ACCEPTED mission but driver stale) ---
+        offline_alerts = get_driver_offline_alerts(150)
+        if offline_alerts:
+            st.markdown("""
+                <div style="background:#ff660022; border:2px solid #ff6600; color:#ff6600; padding:12px; border-radius:8px; margin-bottom:12px; font-family:'Orbitron';">
+                    ⚠️ DRIVER OFFLINE — Unit on mission but no heartbeat
+                </div>
+            """, unsafe_allow_html=True)
+            for a in offline_alerts:
+                st.warning(f"**{a['mission_id']}** — {a['driver_id']} last seen {a['seen_ago']//60}m ago. Check unit status.")
         
         # --- PENDING clearance requests ---
         pending = get_drivers_pending_clearance()
@@ -1456,10 +1705,12 @@ def render_dashboard():
                 with c2:
                     if st.button("✅ GRANT", key=f"grant_{did}"):
                         update_driver_clearance(did, "GRANTED")
+                        send_hq_message(did, "🟢 Green Wave GRANTED — Proceed with caution.", "HQ_GREENWAVE")
                         st.rerun()
                 with c3:
                     if st.button("❌ DENY", key=f"deny_{did}"):
                         update_driver_clearance(did, "DENIED")
+                        send_hq_message(did, "🔴 Green Wave request denied.", "HQ_ALERT")
                         st.rerun()
         
         # --- FILTERS: Mission status + Unit search ---
@@ -1468,7 +1719,7 @@ def render_dashboard():
             st.markdown("**📋 Mission Status**")
             mission_status_filter = st.multiselect(
                 "Show missions",
-                ["DISPATCHED", "ACCEPTED", "COMPLETED", "CANCELLED"],
+                ["DISPATCHED", "ACCEPTED", "COMPLETED", "CANCELLED", "EXPIRED"],
                 default=["DISPATCHED", "ACCEPTED"],
                 key="lt_mission_status"
             )
@@ -1485,7 +1736,7 @@ def render_dashboard():
             )
         with lt_col4:
             st.markdown("**📍 Track Unit / Mission**")
-            all_drivers_df = get_all_active_drivers(60)
+            all_drivers_df = get_drivers_for_live_map(60)
             driver_options = ["All units"] + (all_drivers_df["driver_id"].tolist() if not all_drivers_df.empty else [])
             # Focus by mission
             active_missions = list_missions(50)
@@ -1510,7 +1761,7 @@ def render_dashboard():
             ]
         
         # --- Units table (filtered by status + search) ---
-        active_df = get_all_active_drivers(60)
+        active_df = get_drivers_for_live_map(60)
         if not active_df.empty and unit_status_filter:
             active_df = active_df[active_df["status"].isin(unit_status_filter)]
         if unit_search and not active_df.empty:
@@ -1522,12 +1773,7 @@ def render_dashboard():
             st.info("No units match filters. Open driverapp to bring units online.")
         else:
             active_display = active_df.copy()
-            if "last_seen" in active_display.columns:
-                now = datetime.datetime.now()
-                active_display["last_seen"] = pd.to_datetime(active_display["last_seen"], errors="coerce")
-                active_display["seen_ago"] = ((now - active_display["last_seen"]).dt.total_seconds()).fillna(999).astype(int)
-                active_display["last_seen_str"] = active_display["seen_ago"].apply(lambda s: f"{s}s ago" if s < 60 else f"{s//60}m ago" if s < 3600 else "—")
-            show_cols = [c for c in ["driver_id", "status", "speed", "origin", "destination", "active_mission_id", "last_seen_str"] if c in active_display.columns]
+            show_cols = [c for c in ["driver_id", "status", "speed", "origin", "destination", "active_mission_id"] if c in active_display.columns]
             disp = active_display[show_cols].copy() if show_cols else active_display.copy()
             disp.insert(0, "#", range(1, len(disp) + 1))
             st.dataframe(disp, use_container_width=True, height=180)
@@ -1554,18 +1800,23 @@ def render_dashboard():
         # Set route (active_org, active_dst) from driver's mission when unit is selected
         if focus_driver_id:
             drv_telemetry = get_driver_status_by_id(focus_driver_id) or get_driver_from_drivers_table(focus_driver_id)
-            if drv_telemetry:
-                org_key = drv_telemetry.get("origin") or drv_telemetry.get("dest")
-                dst_key = drv_telemetry.get("dest") or drv_telemetry.get("origin")
-                if org_key and dst_key and org_key in HOSPITALS and dst_key in HOSPITALS:
-                    active_org = HOSPITALS[org_key]
-                    active_dst = HOSPITALS[dst_key]
+            org_key = drv_telemetry.get("origin") or drv_telemetry.get("dest") if drv_telemetry else None
+            dst_key = drv_telemetry.get("dest") or drv_telemetry.get("destination") or drv_telemetry.get("origin") if drv_telemetry else None
+            # Fallback: use mission data when driver hasn't accepted yet (no origin/dest in telemetry)
+            if (not org_key or not dst_key):
+                mission = get_current_mission_for_driver(focus_driver_id)
+                if mission:
+                    org_key = mission.get("origin")
+                    dst_key = mission.get("destination")
+            if org_key and dst_key and org_key in HOSPITALS and dst_key in HOSPITALS:
+                active_org = HOSPITALS[org_key]
+                active_dst = HOSPITALS[dst_key]
         
         # Refresh map button
         if st.button("🔄 REFRESH MAP", key="lt_refresh_map", use_container_width=False):
             st.rerun()
         st.markdown("---")
-        # --- "Currently viewing: UNIT-XX" card with mission details (only when a unit is selected) ---
+        # --- "Currently viewing: UNIT-XX" card with mission details + ETA & route alternatives ---
         if focus_driver_id:
             mission_info = get_current_mission_for_driver(focus_driver_id)
             drv_telemetry = get_driver_status_by_id(focus_driver_id) or get_driver_from_drivers_table(focus_driver_id)
@@ -1574,6 +1825,27 @@ def render_dashboard():
             vnum = prof.get("vehicle_id", "—")
             org_disp = drv_telemetry.get("origin", "—") if drv_telemetry else "—"
             dst_disp = drv_telemetry.get("dest") or drv_telemetry.get("destination", "—") if drv_telemetry else "—"
+            # ETA & route alternatives when we have origin/destination
+            eta_routes_html = ""
+            if active_org is not None and active_dst is not None:
+                lt_routes = fetch_routes(active_org, active_dst, prio_factor)
+                if lt_routes:
+                    best = lt_routes[0]
+                    eta_min = best.get("eta", 0)
+                    dist_km = best.get("dist", 0)
+                    eta_routes_html = f"""
+                    <div style="grid-column:1/-1; margin-top:12px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.08);">
+                        <div style="color:#666; font-size:11px; margin-bottom:8px;">⏱ ESTIMATED TIME & ROUTE ALTERNATIVES</div>
+                        <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
+                            <span style="font-family:'Orbitron'; font-size:24px; color:#00f3ff;">{eta_min} <span style="font-size:12px; color:#888;">MIN</span></span>
+                            <span style="color:#888;">|</span>
+                            <span style="color:#9ca3af;">📍 {dist_km} km</span>
+                            <span style="color:#666;">|</span>
+                            <span style="font-size:12px; color:#9ca3af;">"""
+                    for i, r in enumerate(lt_routes[:4]):
+                        c = ["#ff003c", "#00f3ff", "#ffcc00", "#00ff9d"][i % 4]
+                        eta_routes_html += f'<span style="margin-right:12px; color:{c};">{r.get("route_type","—")}: {r.get("eta",0)} min</span>'
+                    eta_routes_html += "</span></div></div>"
             st.markdown(f"""
             <div class="titan-card" style="border-left:4px solid #00f3ff; padding:20px 24px; margin-bottom:16px; background:linear-gradient(135deg,rgba(0,243,255,0.05),transparent);">
                 <div style="font-family:'Orbitron'; font-size:16px; color:#00f3ff; margin-bottom:12px; display:flex; align-items:center; gap:10px;">
@@ -1587,23 +1859,14 @@ def render_dashboard():
                     <div><span style="color:#666;">Status</span><br><span style="color:#00ff9d;">{drv_telemetry.get('status', '—') if drv_telemetry else '—'}</span></div>
                     <div><span style="color:#666;">From</span><br><span>{org_disp}</span></div>
                     <div><span style="color:#666;">To</span><br><span>{dst_disp}</span></div>
+                    {eta_routes_html}
                 </div>
             </div>
             """, unsafe_allow_html=True)
         
-        # --- Live map: all units on map; route + ghost trail only for selected unit ---
+        # --- Live map: ambulance drivers' live location, status, ghost trail (simulated when no real-time GPS) ---
+        st.caption("🟢 Ambulance markers = live location • Dashed line = ghost trail (path traveled) • Positions simulated when no real-time GPS")
         render_live_tracking_map(active_org, active_dst, prio_factor, focus_driver_id=focus_driver_id)
-        
-        with st.expander("🧭 HQ Route Planner (preview routes)", expanded=False):
-            cA, cB = st.columns(2)
-            with cA: hq_org = st.selectbox("Origin (HQ)", sorted(list(HOSPITALS.keys())), key="hq_org_plan")
-            with cB: hq_dst = st.selectbox("Destination (HQ)", sorted(list(HOSPITALS.keys())), key="hq_dst_plan")
-            if hq_org and hq_dst and hq_org in HOSPITALS and hq_dst in HOSPITALS:
-                plan_routes = fetch_routes(HOSPITALS[hq_org], HOSPITALS[hq_dst], prio_factor)
-                if plan_routes:
-                    best_route = plan_routes[0]
-                    st.metric("Best ETA", f"{best_route.get('eta', 0)} min — {best_route.get('dist', 0)} km")
-                    st.caption("Use Mission Center to dispatch this route.")
 
     with tab3:
         # Call the Fragment
@@ -1619,7 +1882,7 @@ def render_dashboard():
         """, unsafe_allow_html=True)
         missions_df = list_missions()
         if not missions_df.empty:
-            status_filter = st.multiselect("Filter by status", ["DISPATCHED", "ACCEPTED", "COMPLETED", "CANCELLED"], default=["DISPATCHED", "ACCEPTED"])
+            status_filter = st.multiselect("Filter by status", ["DISPATCHED", "ACCEPTED", "COMPLETED", "CANCELLED", "EXPIRED"], default=["DISPATCHED", "ACCEPTED"])
             view = missions_df[missions_df["status"].isin(status_filter)] if status_filter else missions_df
             # Mission cards with priority badges and notes
             PRIO_COLORS = {"CRITICAL": "#ef4444", "HIGH": "#f59e0b", "MEDIUM": "#06b6d4", "STANDARD": "#6b7280"}
@@ -1655,14 +1918,27 @@ def render_dashboard():
                     drv_opts = ["UNASSIGNED"] + (drivers_df["driver_id"].astype(str).tolist() if not drivers_df.empty else [])
                     new_drv = st.selectbox("Assign / Reassign driver", options=drv_opts, key="assign_driver_manage")
                     if st.button("✅ APPLY ASSIGNMENT", use_container_width=True, type="primary"):
-                        update_mission_assignment(selected_mid, None if new_drv == "UNASSIGNED" else new_drv)
+                        old_info = get_mission_details(selected_mid)
+                        old_drv = old_info.get("assigned_driver_id") if old_info else None
+                        new_drv_id = None if new_drv == "UNASSIGNED" else new_drv
+                        update_mission_assignment(selected_mid, new_drv_id)
                         log_activity("REASSIGN", st.session_state.get("operator_id", "HQ"), f"{selected_mid} → {new_drv}")
+                        if old_drv and old_drv != new_drv_id:
+                            send_hq_message(old_drv, f"Mission {selected_mid} reassigned to another unit.", "HQ_ALERT")
+                        if new_drv_id:
+                            org_d = (old_info or {}).get("origin", "—")
+                            dst_d = (old_info or {}).get("destination", "—")
+                            send_hq_message(new_drv_id, f"🚨 NEW MISSION {selected_mid}: {org_d} → {dst_d}. Mission will appear automatically.", "HQ_DISPATCH")
                         st.toast(f"Assigned to {new_drv}")
                         st.rerun()
                 with cB:
                     if st.button("🛑 CANCEL MISSION", use_container_width=True, type="secondary"):
+                        old_info = get_mission_details(selected_mid)
+                        old_drv = old_info.get("assigned_driver_id") if old_info else None
                         update_mission_status(selected_mid, "CANCELLED")
                         log_activity("CANCEL", st.session_state.get("operator_id", "HQ"), selected_mid)
+                        if old_drv:
+                            send_hq_message(old_drv, f"Mission {selected_mid} CANCELLED by HQ.", "HQ_ALERT")
                         st.toast("Mission cancelled")
                         st.rerun()
 
@@ -1957,102 +2233,166 @@ def render_dashboard():
 
     with tab5:
         # ==========================================
-        # V2X COMMUNICATIONS LOG - Full Communication Center
+        # V2X COMMUNICATIONS CENTER - Real-time feed
         # ==========================================
-        st.markdown("## 📶 V2X COMMUNICATIONS CENTER")
-        st.markdown("---")
+        st.markdown("## 📶 V2X COMMUNICATIONS")
+        st.markdown("""
+        <div style="background:rgba(0,243,255,0.08); border:1px solid rgba(0,243,255,0.25); border-radius:12px; padding:16px 20px; margin-bottom:20px; color:#a0aec0; font-size:13px; line-height:1.5;">
+            <strong style="color:#00f3ff;">Vehicle-to-Everything</strong> — Drivers send messages from their app (SOS, Green Wave, status). 
+            They appear here. Use the <strong>Send panel</strong> on the right to reply or broadcast to units.
+        </div>
+        """, unsafe_allow_html=True)
         
-        # Communication Stats
-        comms_df = get_driver_comms(200)
+        # Unit filter + conversation mode + legend
+        unit_filter_col, conv_col, legend_col = st.columns([2, 1, 2])
+        with unit_filter_col:
+            drivers_online = get_available_drivers()
+            online_ids = drivers_online["driver_id"].tolist() if not drivers_online.empty else []
+            unit_ids = get_driver_ids_with_messages()
+            all_unit_ids = list(dict.fromkeys(online_ids + unit_ids))  # Online first, then who sent
+            unit_opts = ["All units"] + all_unit_ids
+            filter_unit = st.selectbox("Filter by unit", unit_opts, key="v2x_unit_filter")
+        with conv_col:
+            show_conversation = st.checkbox("Include HQ replies", value=False, key="v2x_conv_mode", help="Show your messages to this unit")
+        with legend_col:
+            st.caption("🚨 CRITICAL=SOS | ⚠️ WARNING=hazard | 📨 REQUEST=Green Wave | 📡 HQ=Your reply")
         
-        comm_stats_cols = st.columns(4)
-        with comm_stats_cols[0]:
-            total_msgs = len(comms_df)
-            st.markdown(f"""
-            <div class="titan-card" style="text-align:center;">
-                <div class="metric-label">TOTAL MESSAGES</div>
-                <div class="metric-value" style="color:#00f3ff;">{total_msgs}</div>
-            </div>
-            """, unsafe_allow_html=True)
+        # Two-column: Live Feed first (prominent) + Send panel
+        feed_col, msg_col = st.columns([2, 1])
         
-        with comm_stats_cols[1]:
-            requests = len(comms_df[comms_df['status'] == 'REQUEST']) if not comms_df.empty and 'status' in comms_df.columns else 0
-            st.markdown(f"""
-            <div class="titan-card" style="text-align:center;">
-                <div class="metric-label">REQUESTS</div>
-                <div class="metric-value" style="color:#ffcc00;">{requests}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with comm_stats_cols[2]:
-            warnings = len(comms_df[comms_df['status'] == 'WARNING']) if not comms_df.empty and 'status' in comms_df.columns else 0
-            st.markdown(f"""
-            <div class="titan-card" style="text-align:center;">
-                <div class="metric-label">WARNINGS</div>
-                <div class="metric-value" style="color:#ff003c;">{warnings}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with comm_stats_cols[3]:
-            hq_msgs = len(comms_df[comms_df['status'].str.contains('HQ', na=False)]) if not comms_df.empty and 'status' in comms_df.columns else 0
-            st.markdown(f"""
-            <div class="titan-card" style="text-align:center;">
-                <div class="metric-label">HQ BROADCASTS</div>
-                <div class="metric-value" style="color:#00ff9d;">{hq_msgs}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # Two-column layout: Send Message + Live Feed
-        msg_col, feed_col = st.columns([1, 2])
+        with feed_col:
+            @st.fragment(run_every=2)
+            def _comms_feed_live():
+                driver_id_filter = None if filter_unit == "All units" else filter_unit
+                comms_df = get_driver_comms(80, driver_id=driver_id_filter, conversation_mode=show_conversation)
+                # SOS prioritization: CRITICAL first, then WARNING, then rest
+                if not comms_df.empty and 'status' in comms_df.columns:
+                    def _prio(s):
+                        if s == 'CRITICAL': return 0
+                        if s in ('WARNING', 'REQUEST'): return 1
+                        return 2
+                    comms_df = comms_df.copy()
+                    comms_df['_prio'] = comms_df['status'].apply(_prio)
+                    comms_df = comms_df.sort_values(['_prio', 'id'], ascending=[True, False]).drop(columns=['_prio'], errors='ignore')
+                total = len(comms_df)
+                reqs = len(comms_df[comms_df['status'] == 'REQUEST']) if not comms_df.empty and 'status' in comms_df.columns else 0
+                warns = len(comms_df[comms_df['status'].isin(['WARNING', 'CRITICAL'])]) if not comms_df.empty and 'status' in comms_df.columns else 0
+                sos_count = len(comms_df[comms_df['status'] == 'CRITICAL']) if not comms_df.empty and 'status' in comms_df.columns else 0
+                
+                # Sticky CRITICAL alerts section — never scrolls away
+                critical_df = comms_df[comms_df['status'].isin(['CRITICAL', 'WARNING', 'REQUEST'])] if not comms_df.empty and 'status' in comms_df.columns else pd.DataFrame()
+                if not critical_df.empty:
+                    if sos_count > 0:
+                        st.markdown("<style>@keyframes pulse { 50% { opacity: 0.85; box-shadow: 0 0 30px rgba(255,0,60,0.6); } }</style>", unsafe_allow_html=True)
+                    st.markdown("**🚨 CRITICAL ALERTS** — Never miss these")
+                    for _, row in critical_df.head(10).iterrows():
+                        ts, did, sts, msg = row.get('timestamp',''), row.get('driver_id','?'), row.get('status',''), row.get('message','')
+                        c = "#ff003c" if sts == 'CRITICAL' else "#ff6600" if sts == 'WARNING' else "#ffcc00"
+                        dir_label = "←" if 'HQ' not in sts else "→"
+                        st.markdown(f"""
+                        <div style="background:rgba(255,0,60,0.08); border-left:4px solid {c}; padding:10px 12px; margin-bottom:6px; border-radius:6px;">
+                            <span style="color:{c}; font-weight:bold;">{dir_label} {did}</span>
+                            <span style="color:#666; font-size:10px; float:right;">{ts}</span>
+                            <div style="color:#fff; font-size:12px; margin-top:4px;">{msg[:80]}{'...' if len(str(msg))>80 else ''}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    st.markdown("---")
+                
+                header = f"**📨 Live Feed** — Total: {total} | From drivers: {reqs + warns}"
+                if sos_count > 0:
+                    header += f" | 🚨 SOS: {sos_count}"
+                st.markdown(header)
+                if not comms_df.empty:
+                    for _, row in comms_df.head(40).iterrows():
+                        timestamp = row.get('timestamp', '')
+                        driver_id = row.get('driver_id', 'UNKNOWN')
+                        status = row.get('status', 'INFO')
+                        message = row.get('message', '')
+                        dir_label = "←" if 'HQ' not in status else "→"
+                        if status == 'CRITICAL':
+                            color = "#ff003c"
+                            icon = "🚨"
+                            extra_style = "animation: pulse 1.5s infinite; box-shadow: 0 0 20px rgba(255,0,60,0.4);"
+                        elif 'HQ' in status:
+                            color = "#00f3ff"
+                            icon = "📡"
+                            extra_style = ""
+                        elif status == 'REQUEST':
+                            color = "#ffcc00"
+                            icon = "📨"
+                            extra_style = ""
+                        elif status == 'WARNING':
+                            color = "#ff6600"
+                            icon = "⚠️"
+                            extra_style = ""
+                        else:
+                            color = "#888888"
+                            icon = "💬"
+                            extra_style = ""
+                        st.markdown(f"""
+                        <div style="background:#111; border-left:4px solid {color}; padding:12px; margin-bottom:8px; border-radius:6px; {extra_style}">
+                            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                                <span style="color:{color}; font-weight:bold; font-size:12px;">{dir_label} {icon} {driver_id}</span>
+                                <span style="color:#666; font-size:10px;">{timestamp}</span>
+                            </div>
+                            <div style="color:#fff; font-size:13px;">{message}</div>
+                            <div style="color:#666; font-size:10px; margin-top:4px;">{status}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.info("""
+                    **No messages yet.** When drivers send from their app (SOS, Green Wave, status updates), they appear here. 
+                    Use the Send panel on the right to reply or broadcast.
+                    """)
+                st.caption("● Live — refreshes every 2 seconds")
+            _comms_feed_live()
         
         with msg_col:
-            st.markdown("### 📤 HQ Broadcast")
+            st.markdown("### 📤 Send to Driver")
+            drivers_online = get_available_drivers()
+            driver_list = drivers_online["driver_id"].tolist() if not drivers_online.empty else []
+            target_opts = ["ALL UNITS"] + driver_list
             
-            # Quick Actions
-            st.markdown("#### ⚡ Quick Actions")
+            st.markdown("**Target**")
+            target_driver = st.selectbox("Select unit", target_opts, key="comms_target", label_visibility="collapsed")
+            
+            st.markdown("#### ⚡ Quick send (one-tap)")
             quick_cols = st.columns(2)
-            
             with quick_cols[0]:
-                if st.button("🟢 GRANT ALL GREEN", use_container_width=True):
-                    send_hq_message("ALL", "GREEN WAVE AUTHORIZED - All signals cleared for emergency vehicles", "HQ_GREENWAVE")
-                    st.success("Green Wave broadcast sent!")
+                if st.button("🟢 GRANT GREEN", use_container_width=True, key="grant_green"):
+                    tid = "ALL" if target_driver == "ALL UNITS" else target_driver
+                    send_hq_message(tid, "Green Wave GRANTED — Proceed with caution.", "HQ_GREENWAVE")
+                    st.toast(f"Green Wave sent to {target_driver}", icon="🟢")
                     st.rerun()
-            
             with quick_cols[1]:
-                if st.button("🔴 ALERT: STANDBY", use_container_width=True):
-                    send_hq_message("ALL", "STANDBY ALERT - Await further instructions from HQ", "HQ_ALERT")
-                    st.warning("Standby alert sent!")
+                if st.button("🔴 DENY / STANDBY", use_container_width=True, key="deny_standby"):
+                    tid = "ALL" if target_driver == "ALL UNITS" else target_driver
+                    send_hq_message(tid, "Standby — Await further instructions.", "HQ_ALERT")
+                    st.toast(f"Standby sent to {target_driver}", icon="🔴")
                     st.rerun()
             
-            st.markdown("#### 📋 Message Templates")
-            t1, t2, t3 = st.columns(3)
+            st.markdown("#### 📋 Quick templates")
             MSG_TEMPLATES = [
                 ("Proceed", "Proceed to destination. Maintain speed.", "HQ_BROADCAST"),
-                ("Standby", "Standby at current location. Await instructions.", "HQ_ALERT"),
                 ("Return base", "Mission complete. Return to base.", "HQ_BROADCAST"),
                 ("Green granted", "Green Wave granted. Proceed with caution.", "HQ_GREENWAVE"),
                 ("Alternate route", "Take alternate route. Traffic ahead.", "HQ_REROUTE"),
                 ("ETA update", "Provide ETA update to HQ.", "HQ_BROADCAST"),
             ]
             for i, (label, msg, mtype) in enumerate(MSG_TEMPLATES):
-                col = [t1, t2, t3][i % 3]
-                with col:
-                    if st.button(f"📤 {label}", key=f"tpl_{i}", use_container_width=True):
-                        send_hq_message("ALL", msg, mtype)
-                        st.toast(f"Sent: {label}", icon="✅")
-                        st.rerun()
+                if st.button(f"📤 {label}", key=f"tpl_{i}", use_container_width=True):
+                    tid = "ALL" if target_driver == "ALL UNITS" else target_driver
+                    send_hq_message(tid, msg, mtype)
+                    st.toast(f"Sent to {target_driver}: {label}", icon="✅")
+                    st.rerun()
             
             st.markdown("---")
             
             # Custom Message Form
-            st.markdown("#### 📝 Custom Message")
+            st.markdown("#### 📝 Custom message")
             with st.form("hq_message_form"):
-                drivers_online = get_available_drivers()
                 driver_opts = ["ALL UNITS"] + (drivers_online["driver_id"].tolist() if not drivers_online.empty else [])
-                
-                target_driver = st.selectbox("Target", driver_opts)
+                target_driver = st.selectbox("Target", driver_opts, key="hq_msg_target")
                 
                 msg_type = st.selectbox("Message Type", [
                     "HQ_BROADCAST",
@@ -2069,6 +2409,7 @@ def render_dashboard():
                     if message_text:
                         driver_id = "ALL" if target_driver == "ALL UNITS" else target_driver
                         send_hq_message(driver_id, message_text, msg_type)
+                        st.toast(f"Sent to {target_driver}", icon="✅")
                         st.success(f"Message transmitted to {target_driver}!")
                         st.rerun()
                     else:
@@ -2076,98 +2417,35 @@ def render_dashboard():
             
             st.markdown("---")
             
-            # Signal Control Panel
-            st.markdown("#### 🚦 Signal Control")
-            signal_name = st.selectbox("Select Junction", list(SENSORS_GRID.keys())[:10])
-            sig_cols = st.columns(2)
-            with sig_cols[0]:
-                if st.button("🟢 SET GREEN", use_container_width=True, key="set_green"):
-                    try:
-                        conn = sqlite3.connect(DB_FILE)
-                        c = conn.cursor()
-                        c.execute(
-                            "INSERT OR REPLACE INTO signal_status (stop_id, status, last_updated) VALUES (?, ?, ?)",
-                            (signal_name, "GREEN_WAVE", datetime.datetime.now())
-                        )
-                        conn.commit()
-                        conn.close()
-                        st.success(f"Green Wave set for {signal_name}")
-                    except Exception:
-                        st.error("Failed to update signal")
-            with sig_cols[1]:
-                if st.button("🔴 RESET", use_container_width=True, key="reset_sig"):
-                    try:
-                        conn = sqlite3.connect(DB_FILE)
-                        c = conn.cursor()
-                        c.execute("DELETE FROM signal_status WHERE stop_id = ?", (signal_name,))
-                        conn.commit()
-                        conn.close()
-                        st.info(f"Signal reset for {signal_name}")
-                    except Exception:
-                        st.error("Failed to reset signal")
-        
-        with feed_col:
-            st.markdown("### 📨 Live Communications Feed")
-            
-            # Filter options
-            filter_cols = st.columns(3)
-            with filter_cols[0]:
-                filter_type = st.multiselect("Filter by Type", ["REQUEST", "WARNING", "HQ_BROADCAST", "HQ_GREENWAVE", "HQ_ALERT"], default=[])
-            with filter_cols[1]:
-                filter_driver = st.text_input("Filter by Driver ID", "")
-            with filter_cols[2]:
-                show_count = st.slider("Messages to show", 10, 100, 50)
-            
-            # Apply filters
-            filtered_comms = comms_df.copy()
-            if not filtered_comms.empty:
-                if filter_type:
-                    filtered_comms = filtered_comms[filtered_comms['status'].isin(filter_type)]
-                if filter_driver:
-                    filtered_comms = filtered_comms[filtered_comms['driver_id'].str.contains(filter_driver, case=False, na=False)]
-                filtered_comms = filtered_comms.head(show_count)
-            
-            # Display communications as cards
-            if not filtered_comms.empty:
-                for _, row in filtered_comms.iterrows():
-                    timestamp = row.get('timestamp', '')
-                    driver_id = row.get('driver_id', 'UNKNOWN')
-                    status = row.get('status', 'INFO')
-                    message = row.get('message', '')
-                    
-                    # Color coding based on status
-                    if 'HQ' in status:
-                        color = "#00f3ff"
-                        icon = "📡"
-                    elif status == 'REQUEST':
-                        color = "#ffcc00"
-                        icon = "📨"
-                    elif status == 'WARNING':
-                        color = "#ff003c"
-                        icon = "⚠️"
-                    else:
-                        color = "#888888"
-                        icon = "💬"
-                    
-                    st.markdown(f"""
-                    <div style="background:#111; border-left:3px solid {color}; padding:12px; margin-bottom:8px; border-radius:4px;">
-                        <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-                            <span style="color:{color}; font-weight:bold; font-family:'Orbitron'; font-size:12px;">{icon} {driver_id}</span>
-                            <span style="color:#666; font-size:10px;">{timestamp}</span>
-                        </div>
-                        <div style="color:#fff; font-size:13px;">{message}</div>
-                        <div style="color:#888; font-size:10px; margin-top:5px;">TYPE: {status}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.info("No communications yet. Messages from drivers and HQ broadcasts will appear here.")
-            
-            # Auto-refresh indicator
-            st.markdown("""
-            <div style="text-align:center; padding:10px; color:#666; font-size:11px;">
-                🔄 Feed updates automatically when page refreshes
-            </div>
-            """, unsafe_allow_html=True)
+            # Signal Control — in expander (separate from comms)
+            with st.expander("🚦 Traffic Signal Control", expanded=False):
+                signal_name = st.selectbox("Select Junction", list(SENSORS_GRID.keys())[:10], key="v2x_signal")
+                sig_cols = st.columns(2)
+                with sig_cols[0]:
+                    if st.button("🟢 SET GREEN", use_container_width=True, key="set_green"):
+                        try:
+                            conn = sqlite3.connect(DB_FILE)
+                            c = conn.cursor()
+                            c.execute(
+                                "INSERT OR REPLACE INTO signal_status (stop_id, status, last_updated) VALUES (?, ?, ?)",
+                                (signal_name, "GREEN_WAVE", datetime.datetime.now())
+                            )
+                            conn.commit()
+                            conn.close()
+                            st.success(f"Green Wave set for {signal_name}")
+                        except Exception:
+                            st.error("Failed to update signal")
+                with sig_cols[1]:
+                    if st.button("🔴 RESET", use_container_width=True, key="reset_sig"):
+                        try:
+                            conn = sqlite3.connect(DB_FILE)
+                            c = conn.cursor()
+                            c.execute("DELETE FROM signal_status WHERE stop_id = ?", (signal_name,))
+                            conn.commit()
+                            conn.close()
+                            st.info(f"Signal reset for {signal_name}")
+                        except Exception:
+                            st.error("Failed to reset signal")
 
 # --- MAIN ROUTING ---
 if st.session_state.page == 'home': render_home()
