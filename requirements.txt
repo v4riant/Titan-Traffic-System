@@ -36,3 +36,4 @@ tzdata==2025.3
 urllib3==2.6.2
 folium
 streamlit_folium
+plotly
