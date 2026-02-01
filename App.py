@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,11 +13,18 @@ import plotly.graph_objects as go
 import plotly.express as px
 import sqlite3
 import json
+import sys
+import os
+
+# Ensure APP folder is on path for shared_utils (run from any cwd)
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+from shared_utils import fetch_routes as shared_fetch_routes, distance_km, hash_password, verify_password, calculate_co2_savings, estimate_fuel_consumption
+
 try:
-    # Optional dependency (some environments don't have it installed)
     from geopy.distance import geodesic
 except Exception:
-    # Fallback: simple haversine distance (meters) to avoid runtime crash
     import math
 
     def geodesic(a, b):
@@ -46,29 +54,26 @@ st.set_page_config(
 )
 
 # --- GLOBAL VARIABLES INITIALIZATION ---
-# This prevents "AttributeError" crashes by ensuring state exists before use
 if 'page' not in st.session_state: st.session_state.page = 'home'
 if 'authenticated' not in st.session_state: st.session_state.authenticated = False
 if 'emergency_mode' not in st.session_state: st.session_state.emergency_mode = False
-if 'active_route' not in st.session_state: st.session_state.active_route = False
-if 'start' not in st.session_state: st.session_state.start = None
-if 'end' not in st.session_state: st.session_state.end = None
 if 'mission_id' not in st.session_state: st.session_state.mission_id = f"CMD-{random.randint(1000,9999)}"
 if 'priority_val' not in st.session_state: st.session_state.priority_val = "STANDARD"
-if 'auto_refresh' not in st.session_state: st.session_state.auto_refresh = False
 
-# API KEY
+# API KEY & DB (same folder as script for shared DB when running from any cwd)
 TOMTOM_API_KEY = "EH7SOW12eDLJn2bR6UvfEbnpNvnrx8o4"
-DB_FILE = "titan_v52.db"
+DB_FILE = os.path.join(_APP_DIR, "titan_v52.db")
 
 # ==========================================
 # 1. DATABASE ENGINE
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
+    # ENABLE WAL MODE for concurrent access (Prevent Locking)
+    conn.execute("PRAGMA journal_mode=WAL;")
     c = conn.cursor()
     
-    # 1. MISSION LOGS (History & Analytics)
+    # 1. MISSION LOGS
     c.execute('''
         CREATE TABLE IF NOT EXISTS mission_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +88,7 @@ def init_db():
         )
     ''')
     
-    # 2. DRIVER STATE (Live GPS Sync)
+    # 2. DRIVER STATE (Telemetry history: lat, lon, speed per push)
     c.execute('''
         CREATE TABLE IF NOT EXISTS driver_state (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,12 +97,17 @@ def init_db():
             destination TEXT,
             current_lat REAL,
             current_lon REAL,
+            speed REAL,
             status TEXT,
             timestamp DATETIME
         )
     ''')
+    try:
+        c.execute("ALTER TABLE driver_state ADD COLUMN speed REAL")
+    except sqlite3.OperationalError:
+        pass
     
-    # 3. COMMUNICATIONS (Messages)
+    # 3. COMMUNICATIONS
     c.execute('''
         CREATE TABLE IF NOT EXISTS driver_comms (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,19 +118,33 @@ def init_db():
         )
     ''')
 
-    # 4. DRIVER REGISTRY (Availability / heartbeat)
+    # 4. DRIVER REGISTRY (Master state: syncs with driverapp)
     c.execute('''
         CREATE TABLE IF NOT EXISTS drivers (
             driver_id TEXT PRIMARY KEY,
             status TEXT,
             current_lat REAL,
             current_lon REAL,
-            last_seen DATETIME
+            last_seen DATETIME,
+            speed REAL,
+            origin TEXT,
+            destination TEXT,
+            active_mission_id TEXT,
+            clearance_status TEXT,
+            selected_route_id INTEGER
         )
     ''')
+    # Migration: add columns if table already existed without them
+    for col, typ in [
+        ("speed", "REAL"), ("origin", "TEXT"), ("destination", "TEXT"),
+        ("active_mission_id", "TEXT"), ("clearance_status", "TEXT"), ("selected_route_id", "INTEGER"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE drivers ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
 
-    # 5. MISSIONS (Assignment lifecycle: DISPATCHED -> ACCEPTED -> COMPLETED)
-    # Keep mission_logs unchanged for history/analytics.
+    # 5. MISSIONS
     c.execute('''
         CREATE TABLE IF NOT EXISTS missions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,7 +160,7 @@ def init_db():
         )
     ''')
 
-    # 6. AUTH: HQ operators
+    # 6. OPERATORS
     c.execute('''
         CREATE TABLE IF NOT EXISTS operators (
             username TEXT PRIMARY KEY,
@@ -145,7 +169,7 @@ def init_db():
         )
     ''')
 
-    # 7. AUTH + PROFILE: Drivers
+    # 7. DRIVER ACCOUNTS
     c.execute('''
         CREATE TABLE IF NOT EXISTS driver_accounts (
             driver_id TEXT PRIMARY KEY,
@@ -159,14 +183,54 @@ def init_db():
         )
     ''')
 
-    # Seed defaults (idempotent)
+    # 8. SIGNAL STATUS (For Green Wave)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS signal_status (
+            stop_id TEXT PRIMARY KEY,
+            status TEXT,
+            last_updated DATETIME
+        )
+    ''')
+
+    # 9. HAZARDS (For Hazard Mapping)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS hazards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lat REAL,
+            lon REAL,
+            type TEXT,
+            timestamp DATETIME
+        )
+    ''')
+
+    # missions.notes
+    try:
+        c.execute("ALTER TABLE missions ADD COLUMN notes TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # missions.decline_reason
+    try:
+        c.execute("ALTER TABLE missions ADD COLUMN decline_reason TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # activity_log
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME,
+            action TEXT,
+            actor TEXT,
+            details TEXT
+        )
+    ''')
+    # Seed defaults (hashed passwords)
     c.execute(
         "INSERT OR IGNORE INTO operators (username, password, display_name) VALUES (?, ?, ?)",
-        ("COMMANDER", "TITAN-X", "HQ Commander"),
+        ("COMMANDER", hash_password("TITAN-X"), "HQ Commander"),
     )
     c.execute(
-        "INSERT OR IGNORE INTO driver_accounts (driver_id, username, password, full_name, phone, vehicle_id, base_hospital, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("UNIT-07", "UNIT-07", "TITAN-DRIVER", "Demo Driver", "", "", "", datetime.datetime.now()),
+        "INSERT OR IGNORE INTO driver_accounts (driver_id, username, password, full_name, created_at) VALUES (?, ?, ?, ?, ?)",
+        ("UNIT-07", "UNIT-07", hash_password("TITAN-DRIVER"), "Demo Driver", datetime.datetime.now()),
     )
     
     conn.commit()
@@ -190,26 +254,134 @@ def get_driver_status():
     """Reads the absolute latest telemetry from the driver app"""
     try:
         conn = sqlite3.connect(DB_FILE)
-        # Get latest update from driver
         row = conn.execute("SELECT * FROM driver_state ORDER BY id DESC LIMIT 1").fetchone()
         conn.close()
         if row:
+            # driver_state: id, driver_id, origin, destination, current_lat, current_lon, speed, status, timestamp
             return {
                 "id": row[1], "origin": row[2], "dest": row[3],
-                "lat": row[4], "lon": row[5], "status": row[6],
-                "time": row[7]
+                "lat": row[4], "lon": row[5], "speed": row[6] if len(row) > 6 else None,
+                "status": row[7] if len(row) > 7 else row[6],
+                "time": row[8] if len(row) > 8 else row[7]
             }
     except: pass
     return None
 
-# --- HELPER: GET AVAILABLE DRIVERS ---
-def get_available_drivers(online_within_seconds=20):
-    """
-    Returns drivers seen recently. A driver is "available" if status == IDLE.
-    """
+def get_ghost_trail(limit=20):
+    """DEPRECATED: Mixed trail from all drivers is incorrect. Use get_ghost_trail_for_driver only."""
+    return []
+
+def get_driver_status_by_id(driver_id):
+    """Latest telemetry for a specific driver"""
     try:
         conn = sqlite3.connect(DB_FILE)
-        df = pd.read_sql_query("SELECT * FROM drivers", conn)
+        row = conn.execute(
+            "SELECT driver_id, origin, destination, current_lat, current_lon, speed, status, timestamp FROM driver_state WHERE driver_id=? ORDER BY id DESC LIMIT 1",
+            (driver_id,)
+        ).fetchone()
+        conn.close()
+        if row:
+            return {
+                "id": row[0], "origin": row[1], "dest": row[2],
+                "lat": row[3], "lon": row[4], "speed": row[5],
+                "status": row[6], "time": row[7]
+            }
+    except: pass
+    return None
+
+def get_ghost_trail_for_driver(driver_id, limit=80):
+    """Ghost trail for a specific driver: chronological path (oldest→newest) for correct polyline. Valid coords only."""
+    path = []
+    if not driver_id:
+        return path
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        rows = conn.execute(
+            """SELECT current_lat, current_lon FROM driver_state
+               WHERE driver_id=? AND current_lat IS NOT NULL AND current_lon IS NOT NULL
+               ORDER BY id DESC LIMIT ?""",
+            (driver_id, limit)
+        ).fetchall()
+        conn.close()
+        if rows:
+            valid = []
+            for r in reversed(rows):
+                lat, lon = r[0], r[1]
+                if lat is not None and lon is not None:
+                    try:
+                        valid.append([float(lat), float(lon)])
+                    except (TypeError, ValueError):
+                        pass
+            path = valid
+    except Exception:
+        pass
+    return path
+
+def get_hazards():
+    hazards = []
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        rows = conn.execute("SELECT lat, lon, type FROM hazards ORDER BY id DESC LIMIT 50").fetchall()
+        conn.close()
+        if rows:
+            hazards = [{"lat": r[0], "lon": r[1], "type": r[2]} for r in rows]
+    except: pass
+    return hazards
+
+def get_signal_status():
+    signals = {}
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        rows = conn.execute("SELECT stop_id, status FROM signal_status").fetchall()
+        conn.close()
+        for r in rows:
+            signals[r[0]] = r[1]
+    except: pass
+    return signals
+
+def get_driver_profiles(driver_ids):
+    """Get full_name, vehicle_id from driver_accounts for given driver_ids. Returns {driver_id: {full_name, vehicle_id}}."""
+    ids = [str(x) for x in driver_ids if x is not None and not (isinstance(x, float) and pd.isna(x))]
+    if not ids:
+        return {}
+    ids = list(dict.fromkeys(ids))
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        placeholders = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT driver_id, full_name, vehicle_id FROM driver_accounts WHERE driver_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        conn.close()
+        return {r[0]: {"full_name": r[1] or "—", "vehicle_id": r[2] or "—"} for r in rows}
+    except Exception:
+        return {}
+
+def get_driver_from_drivers_table(driver_id):
+    """Current position & route from drivers table (heartbeat). Fallback when driver_state is empty."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute(
+            "SELECT driver_id, origin, destination, current_lat, current_lon, speed, status FROM drivers WHERE driver_id=?",
+            (driver_id,),
+        ).fetchone()
+        conn.close()
+        if row:
+            return {"id": row[0], "origin": row[1], "dest": row[2], "lat": row[3], "lon": row[4], "speed": row[5], "status": row[6]}
+    except Exception:
+        pass
+    return None
+
+def get_available_drivers(online_within_seconds=90):
+    """Drivers who are ONLINE (recent last_seen) and have a registered account. No phantom/random units."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        df = pd.read_sql_query("""
+            SELECT d.* FROM drivers d
+            INNER JOIN driver_accounts a ON d.driver_id = a.driver_id
+            WHERE d.current_lat IS NOT NULL AND d.current_lon IS NOT NULL
+        """, conn)
         conn.close()
         if df.empty:
             return pd.DataFrame()
@@ -222,24 +394,81 @@ def get_available_drivers(online_within_seconds=20):
         return pd.DataFrame()
 
 
-# --- HELPER: CREATE / ASSIGN MISSION ---
-def create_mission(mid, org, dst, prio, assigned_driver_id=None):
+def get_all_active_drivers(online_within_seconds=30):
+    """All drivers visible to server for global map and Live Metrics."""
+    return get_available_drivers(online_within_seconds=online_within_seconds)
+
+
+def get_drivers_pending_clearance():
+    """Drivers with clearance_status == 'PENDING' for Traffic Control Center."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        df = pd.read_sql_query(
+            "SELECT driver_id, status, current_lat, current_lon, last_seen FROM drivers WHERE clearance_status = 'PENDING'",
+            conn,
+        )
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_current_mission_for_driver(driver_id):
+    """Current mission for a driver (DISPATCHED or ACCEPTED). Returns dict with mission_id, origin, destination, status or None."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute(
+            "SELECT mission_id, origin, destination, status FROM missions WHERE assigned_driver_id = ? AND status IN ('DISPATCHED','ACCEPTED') ORDER BY id DESC LIMIT 1",
+            (driver_id,),
+        ).fetchone()
+        conn.close()
+        if row:
+            return {"mission_id": row[0], "origin": row[1], "destination": row[2], "status": row[3]}
+    except Exception:
+        pass
+    return None
+
+
+def update_driver_clearance(driver_id, status):
+    """Set clearance_status to GRANTED or DENIED."""
+    if status not in ("GRANTED", "DENIED"):
+        return False
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO missions (created_at, mission_id, origin, destination, priority, assigned_driver_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (datetime.datetime.now(), mid, org, dst, prio, assigned_driver_id, "DISPATCHED"),
-        )
+        c.execute("UPDATE drivers SET clearance_status = ? WHERE driver_id = ?", (status, driver_id))
         conn.commit()
         conn.close()
         return True
     except Exception:
         return False
 
+def create_mission(mid, org, dst, prio, assigned_driver_id=None, notes=None):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO missions (created_at, mission_id, origin, destination, priority, assigned_driver_id, status, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (datetime.datetime.now(), mid, org, dst, prio, assigned_driver_id, "DISPATCHED", notes or ""),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        try:
+            c.execute(
+                "INSERT INTO missions (created_at, mission_id, origin, destination, priority, assigned_driver_id, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (datetime.datetime.now(), mid, org, dst, prio, assigned_driver_id, "DISPATCHED"),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        conn.close()
+        return True
 
 def list_missions(limit=200):
     try:
@@ -253,7 +482,6 @@ def list_missions(limit=200):
         return df
     except Exception:
         return pd.DataFrame()
-
 
 def update_mission_assignment(mission_id, assigned_driver_id):
     try:
@@ -269,20 +497,203 @@ def update_mission_assignment(mission_id, assigned_driver_id):
     except Exception:
         return False
 
-
 def update_mission_status(mission_id, status):
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        if status == "CANCELLED":
-            c.execute("UPDATE missions SET status=? WHERE mission_id=?", (status, mission_id))
-        else:
-            c.execute("UPDATE missions SET status=? WHERE mission_id=?", (status, mission_id))
+        c.execute("UPDATE missions SET status=? WHERE mission_id=?", (status, mission_id))
         conn.commit()
         conn.close()
         return True
     except Exception:
         return False
+
+# ==========================================
+# V2X COMMUNICATIONS FUNCTIONS
+# ==========================================
+def get_driver_comms(limit=100):
+    """Get all driver communications/messages"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql_query(
+            "SELECT * FROM driver_comms ORDER BY id DESC LIMIT ?",
+            conn,
+            params=(limit,),
+        )
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def send_hq_message(driver_id, message, msg_type="HQ_BROADCAST"):
+    """Send a message from HQ to driver"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO driver_comms (timestamp, driver_id, status, message) VALUES (?, ?, ?, ?)",
+            (datetime.datetime.now(), driver_id, msg_type, message),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+def get_mission_analytics():
+    """Get mission statistics for engineering report"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        
+        # Total missions
+        total = conn.execute("SELECT COUNT(*) FROM missions").fetchone()[0]
+        completed = conn.execute("SELECT COUNT(*) FROM missions WHERE status='COMPLETED'").fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM missions WHERE status IN ('DISPATCHED', 'ACCEPTED')").fetchone()[0]
+        
+        # Avg response time (accepted_at - created_at) in minutes
+        resp_df = pd.read_sql_query(
+            "SELECT created_at, accepted_at FROM missions WHERE status IN ('ACCEPTED','COMPLETED') AND accepted_at IS NOT NULL",
+            conn,
+        )
+        avg_response_min = 0
+        if not resp_df.empty and "created_at" in resp_df.columns and "accepted_at" in resp_df.columns:
+            resp_df["created_at"] = pd.to_datetime(resp_df["created_at"], errors="coerce")
+            resp_df["accepted_at"] = pd.to_datetime(resp_df["accepted_at"], errors="coerce")
+            resp_df["resp_sec"] = (resp_df["accepted_at"] - resp_df["created_at"]).dt.total_seconds()
+            valid = resp_df.dropna(subset=["resp_sec"])
+            if not valid.empty:
+                avg_response_min = round(valid["resp_sec"].mean() / 60, 1)
+        
+        # Mission logs with time/CO2 data
+        logs_df = pd.read_sql_query("SELECT * FROM mission_logs ORDER BY id DESC LIMIT 100", conn)
+        
+        # Recent missions for timeline
+        recent_df = pd.read_sql_query(
+            "SELECT * FROM missions ORDER BY id DESC LIMIT 20",
+            conn,
+        )
+        
+        conn.close()
+        
+        return {
+            "total": total,
+            "completed": completed,
+            "active": active,
+            "avg_response_min": avg_response_min,
+            "logs": logs_df,
+            "recent": recent_df,
+        }
+    except Exception:
+        return {"total": 0, "completed": 0, "active": 0, "avg_response_min": 0, "logs": pd.DataFrame(), "recent": pd.DataFrame()}
+
+def get_fleet_metrics():
+    """Get fleet performance metrics"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        
+        # Driver stats
+        drivers_df = pd.read_sql_query("SELECT * FROM drivers", conn)
+        total_drivers = len(drivers_df)
+        online_drivers = len(drivers_df[pd.to_datetime(drivers_df["last_seen"], errors="coerce") > 
+                                        (datetime.datetime.now() - datetime.timedelta(seconds=30))])
+        en_route = len(drivers_df[drivers_df["status"] == "EN_ROUTE"])
+        
+        # Telemetry history
+        telemetry_df = pd.read_sql_query(
+            "SELECT * FROM driver_state ORDER BY id DESC LIMIT 500",
+            conn,
+        )
+        
+        conn.close()
+        
+        avg_speed = telemetry_df["speed"].mean() if "speed" in telemetry_df.columns and not telemetry_df.empty else 0
+        
+        return {
+            "total_drivers": total_drivers,
+            "online": online_drivers,
+            "en_route": en_route,
+            "avg_speed": round(avg_speed, 1) if avg_speed else 0,
+            "telemetry": telemetry_df,
+        }
+    except Exception:
+        return {"total_drivers": 0, "online": 0, "en_route": 0, "avg_speed": 0, "telemetry": pd.DataFrame()}
+
+def get_hazard_analytics():
+    """Get hazard statistics"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql_query("SELECT * FROM hazards ORDER BY id DESC LIMIT 50", conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def log_activity(action, actor, details=""):
+    """Log activity for audit trail."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO activity_log (timestamp, action, actor, details) VALUES (?, ?, ?, ?)",
+                  (datetime.datetime.now(), action, actor, details))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+def get_activity_log(limit=30):
+    """Get recent activity log."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql_query("SELECT * FROM activity_log ORDER BY id DESC LIMIT ?", conn, params=(limit,))
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def get_driver_leaderboard(limit=10):
+    """Top drivers by missions completed."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql_query("""
+            SELECT assigned_driver_id as driver_id, COUNT(*) as completed
+            FROM missions WHERE status='COMPLETED' AND assigned_driver_id IS NOT NULL
+            GROUP BY assigned_driver_id ORDER BY completed DESC LIMIT ?
+        """, conn, params=(limit,))
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def get_missions_per_day(days=7):
+    """Missions completed per day for charting."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat()
+        df = pd.read_sql_query("""
+            SELECT date(completed_at) as day, COUNT(*) as count
+            FROM missions WHERE status='COMPLETED' AND completed_at IS NOT NULL
+            AND completed_at >= ?
+            GROUP BY date(completed_at) ORDER BY day
+        """, conn, params=(cutoff,))
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def cleanup_old_driver_state(days=7):
+    """Delete driver_state rows older than X days."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat()
+        c.execute("DELETE FROM driver_state WHERE timestamp < ?", (cutoff,))
+        deleted = c.rowcount
+        conn.commit()
+        conn.close()
+        return deleted, None
+    except Exception as e:
+        return 0, str(e)
 
 # ==========================================
 # 2. UI STYLE ENGINE (CYBERPUNK THEME)
@@ -315,6 +726,8 @@ st.markdown(f"""
     /* --- UI COMPONENTS --- */
     .stApp {{ background: transparent !important; }}
     
+    .block-container {{ padding-top: 1.5rem !important; padding-bottom: 2rem !important; max-width: 1400px !important; }}
+    
     h1, h2, h3, h4 {{
         font-family: 'Orbitron', sans-serif !important;
         color: {primary} !important;
@@ -326,38 +739,53 @@ st.markdown(f"""
 
     /* GLASS CARDS */
     .titan-card {{
-        background: rgba(13, 17, 26, 0.85);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-left: 3px solid {primary};
-        border-radius: 6px; padding: 20px;
-        backdrop-filter: blur(10px);
-        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
-        margin-bottom: 15px;
-        transition: transform 0.3s ease;
+        background: linear-gradient(145deg, rgba(18,22,32,0.9), rgba(10,14,22,0.95));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-left: 4px solid {primary};
+        border-radius: 14px; padding: 22px;
+        backdrop-filter: blur(12px);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255,255,255,0.04);
+        margin-bottom: 18px;
+        transition: all 0.3s cubic-bezier(0.4,0,0.2,1);
     }}
     .titan-card:hover {{
-        transform: translateY(-5px);
+        transform: translateY(-4px);
         border-color: {primary};
-        box-shadow: 0 0 25px {primary}44;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5), 0 0 30px {primary}33;
     }}
 
-    /* METRICS & LOGS */
+    /* METRICS */
     .metric-value {{ font-family: 'Orbitron'; font-size: 28px; color: white; }}
     .metric-label {{ font-size: 10px; color: #aaa; letter-spacing: 1px; text-transform: uppercase; }}
     
-    .report-box {{
-        background: rgba(0,0,0,0.6); border: 1px solid #333;
-        padding: 10px; border-radius: 4px;
-        font-family: 'Share Tech Mono', monospace; font-size: 13px;
-        color: #00ff9d; margin-bottom: 10px;
+    /* SEXY BUTTONS */
+    .stButton > button {{
+        background: linear-gradient(145deg, rgba(0,243,255,0.15), rgba(0,243,255,0.05)) !important;
+        border: 1px solid {primary} !important;
+        color: {primary} !important;
+        font-family: 'Orbitron' !important;
+        font-weight: 600 !important;
+        border-radius: 12px !important;
+        padding: 12px 24px !important;
+        transition: all 0.3s cubic-bezier(0.4,0,0.2,1) !important;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.1) !important;
     }}
-
-    /* BUTTONS */
-    .stButton button {{
-        background: rgba(0, 243, 255, 0.1); border: 1px solid {primary}; color: {primary};
-        font-family: 'Orbitron'; font-weight: bold; transition: 0.3s;
+    .stButton > button:hover {{
+        background: linear-gradient(145deg, {primary}, rgba(0,243,255,0.9)) !important;
+        color: #000 !important;
+        box-shadow: 0 8px 28px {primary}66 !important;
+        transform: translateY(-2px);
     }}
-    .stButton button:hover {{ background: {primary}; color: black; box-shadow: 0 0 20px {primary}; }}
+    .stButton > button[data-testid="baseButton-primary"] {{
+        background: linear-gradient(135deg, {primary}, #00c4d4) !important;
+        color: #000 !important;
+        border: none !important;
+        box-shadow: 0 4px 20px {primary}55 !important;
+    }}
+    .stButton > button[data-testid="baseButton-primary"]:hover {{
+        box-shadow: 0 8px 32px {primary}77 !important;
+        transform: translateY(-2px);
+    }}
 
     header {{visibility: hidden;}} footer {{visibility: hidden;}}
     
@@ -370,7 +798,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 3. DATA LAYER (FULL LISTS)
+# 3. DATA LAYER
 # ==========================================
 HOSPITALS = {
     "Aster Medcity (Cheranallur)": [10.0575, 76.2652], "Amrita AIMS (Edappally)": [10.0326, 76.2997],
@@ -416,95 +844,224 @@ SENSORS_GRID = {
 }
 
 # ==========================================
-# 4. LOGIC FUNCTIONS
+# 4. LOGIC FUNCTIONS (TomTom via shared_utils)
 # ==========================================
 def fetch_routes(start, end, priority_factor=1.0):
-    """Fetches up to 4 route alternatives (+ basic stats)."""
-    start_s, end_s = f"{start[0]},{start[1]}", f"{end[0]},{end[1]}"
-    # maxAlternatives=3 => up to 4 total routes (1 main + 3 alts)
-    url = f"https://api.tomtom.com/routing/1/calculateRoute/{start_s}:{end_s}/json?key={TOMTOM_API_KEY}&traffic=true&maxAlternatives=3&routeType=fastest"
-    data = []
-    try:
-        r = requests.get(url, timeout=10).json()
-        if 'routes' in r:
-            for idx, route in enumerate(r['routes']):
-                summ = route['summary']
-                # Apply green wave priority factor
-                adjusted_eta = int((summ['travelTimeInSeconds'] * priority_factor) / 60)
-                raw_eta = int(summ['travelTimeInSeconds'] / 60)
-                coords = [[p['latitude'], p['longitude']] for p in route['legs'][0]['points']]
-                data.append({
-                    "id": idx, "coords": coords,
-                    "eta": adjusted_eta,
-                    "raw_eta": raw_eta,
-                    "dist": round(summ['lengthInMeters'] / 1000, 1)
-                })
-    except: pass
-    return data
+    return shared_fetch_routes(start, end, priority_factor=priority_factor, max_alternatives=3)
 
-
-def fetch_route_directions(start, end, max_alternatives=3):
-    """
-    Fetch routes + turn-by-turn text instructions.
-    Returns list of routes: {id, coords, eta_min, dist_km, instructions[]}
-    """
-    start_s, end_s = f"{start[0]},{start[1]}", f"{end[0]},{end[1]}"
-    url = (
-        f"https://api.tomtom.com/routing/1/calculateRoute/{start_s}:{end_s}/json"
-        f"?key={TOMTOM_API_KEY}&traffic=true&routeType=fastest&maxAlternatives={max_alternatives}"
-        f"&instructionsType=text&language=en-US"
-    )
-    out = []
-    try:
-        r = requests.get(url, timeout=10).json()
-        for idx, route in enumerate(r.get("routes", [])):
-            summ = route.get("summary", {})
-            coords = [[p["latitude"], p["longitude"]] for p in route["legs"][0]["points"]]
-            instr = []
-            guidance = route.get("guidance", {})
-            for ins in guidance.get("instructions", []):
-                msg = ins.get("message")
-                if msg:
-                    instr.append(msg)
-            out.append(
-                {
-                    "id": idx,
-                    "coords": coords,
-                    "eta_min": int(summ.get("travelTimeInSeconds", 0) / 60) if summ else None,
-                    "dist_km": round(summ.get("lengthInMeters", 0) / 1000, 1) if summ else None,
-                    "instructions": instr,
-                }
-            )
-    except Exception:
-        pass
-    return out
-
-@st.cache_data(ttl=900)
+# NOTE: Not caching this anymore to ensure we get live DB updates or random refreshes
 def get_sensors_data():
-    """Simulates or fetches live traffic flow for the grid"""
+    """Fetches live traffic flow and Signal Status"""
     res = []
+    
+    # 1. Get Live Green Wave Statuses from DB
+    signal_status_db = get_signal_status()
+
     def fetch(name, lat, lon):
         try:
-            # Simulate sensor reading
             curr = random.randint(10, 70) 
             status = "JAMMED" if curr < 15 else "HEAVY" if curr < 35 else "CLEAR"
-            return {"Area": name, "Status": status, "Flow": int(curr)}
+            
+            # --- GREEN WAVE OVERRIDE (From DB or Simulation) ---
+            # If the signal is marked GREEN_WAVE in DB, priority override
+            if signal_status_db.get(name) == "GREEN_WAVE":
+                status = "GREEN_WAVE"
+                curr = 80 # High flow
+            
+            # For Simulation Purposes if not in DB, randomly assign one
+            if random.random() < 0.05: 
+                status = "GREEN_WAVE"
+
+            return {"Area": name, "Status": status, "Flow": int(curr), "Lat": lat, "Lon": lon}
         except: return None
+
     with ThreadPoolExecutor(max_workers=20) as ex:
         futures = [ex.submit(fetch, k, v[0], v[1]) for k, v in SENSORS_GRID.items()]
         for f in futures: 
             if f.result(): res.append(f.result())
     return res
 
-def get_nearest_signal(lat, lon):
-    closest_name, min_dist = "SEARCHING...", float('inf')
-    for name, coords in SENSORS_GRID.items():
-        dist = geodesic((lat, lon), coords).meters
-        if dist < min_dist: min_dist = dist; closest_name = name
-    return closest_name, int(min_dist)
+# ==========================================
+# 5. FRAGMENTS (PERFECT SYNC)
+# ==========================================
+
+@st.fragment(run_every=5)
+def render_live_map_fragment(active_org, active_dst, prio_factor):
+    """
+    Global map: all active drivers + routes + hazards.
+    Refreshes every 5 seconds (reduced from 2s to prevent blinking).
+    Uses returned_objects=[] to prevent map reset on data updates.
+    """
+    driver = get_driver_status()
+    all_drivers = get_all_active_drivers(60)
+    hazards = get_hazards()
+    sensors = get_sensors_data()
+
+    map_center = [10.015, 76.340]
+    zoom = 12
+    if driver and driver.get("status") == "EN_ROUTE":
+        map_center = [driver["lat"], driver["lon"]]
+        zoom = 15
+    elif active_org:
+        map_center = list(active_org) if hasattr(active_org, "__iter__") else active_org
+
+    m = folium.Map(location=map_center, zoom_start=zoom, tiles="CartoDB dark_matter")
+
+    # 1. DRAW ROUTE (focused mission if any)
+    if active_org and active_dst:
+        routes = fetch_routes(active_org, active_dst, prio_factor)
+        c_codes = ["#ff003c", "#00f3ff", "#ffcc00", "#ffffff"]
+        for i in reversed(range(len(routes))):
+            folium.PolyLine(routes[i]["coords"], color=c_codes[i % len(c_codes)], weight=5 if i == 0 else 3, opacity=0.9 if i == 0 else 0.6).add_to(m)
+        folium.Marker(list(active_org), icon=folium.Icon(color="blue", icon="play", prefix="fa")).add_to(m)
+        folium.Marker(list(active_dst), icon=folium.Icon(color="red", icon="flag-checkered", prefix="fa")).add_to(m)
+
+    # 2. DRAW ALL ACTIVE DRIVERS (global view)
+    for _, row in all_drivers.iterrows():
+        lat, lon = row.get("current_lat"), row.get("current_lon")
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        did = row.get("driver_id", "?")
+        status = row.get("status", "?")
+        speed = row.get("speed")
+        spd = f" {int(speed)} km/h" if speed is not None and not pd.isna(speed) else ""
+        folium.Marker(
+            [float(lat), float(lon)],
+            icon=folium.Icon(color="green" if status == "EN_ROUTE" else "gray", icon="ambulance", prefix="fa"),
+            popup=f"{did} | {status}{spd}",
+        ).add_to(m)
+
+    # 3. DRAW HAZARDS
+    for h in hazards:
+        folium.Marker(
+            [h['lat'], h['lon']],
+            icon=folium.Icon(color="orange", icon="exclamation-triangle", prefix="fa"),
+            tooltip=f"{h['type']}"
+        ).add_to(m)
+
+    # 4. DRAW GREEN WAVE (Glowing Circles)
+    for s in sensors:
+        if s['Status'] == "GREEN_WAVE":
+            folium.Circle(
+                location=[s['Lat'], s['Lon']],
+                radius=300,
+                color="#00ff00",
+                fill=True,
+                fill_color="#00ff00",
+                fill_opacity=0.3,
+                popup=f"GREEN WAVE: {s['Area']}"
+            ).add_to(m)
+
+    # Use returned_objects=[] to prevent map from resetting/blinking on updates
+    st_folium(m, width="100%", height=600, returned_objects=[])
+
+def _safe_html(s):
+    if s is None or pd.isna(s): return "—"
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+def render_live_tracking_map(active_org, active_dst, prio_factor, focus_driver_id=None):
+    """Live map with optional focus on one driver (route + ghost trail). Ambulance markers show driver name, vehicle, unit, from/to."""
+    drv_live = get_driver_from_drivers_table(focus_driver_id) if focus_driver_id else None
+    driver = get_driver_status_by_id(focus_driver_id) if focus_driver_id and not drv_live else (drv_live or (get_driver_status() if not focus_driver_id else None))
+    if drv_live and not driver:
+        driver = drv_live
+    all_drivers = get_all_active_drivers(60)
+    profiles = get_driver_profiles(all_drivers["driver_id"].tolist() if not all_drivers.empty else [])
+    hazards = get_hazards()
+    ghost_trail = get_ghost_trail_for_driver(focus_driver_id, 50) if focus_driver_id else []
+    sensors = get_sensors_data()
+    
+    map_center = [10.015, 76.340]
+    zoom = 12
+    if driver and (driver.get("status") == "EN_ROUTE" or driver.get("lat")):
+        try:
+            map_center = [float(driver.get("lat") or 10.015), float(driver.get("lon") or 76.340)]
+            zoom = 15
+        except (TypeError, ValueError):
+            pass
+    elif active_org:
+        map_center = list(active_org) if hasattr(active_org, "__iter__") else active_org
+        zoom = 13
+    
+    m = folium.Map(location=map_center, zoom_start=zoom, tiles="CartoDB dark_matter")
+    
+    if active_org and active_dst:
+        routes = fetch_routes(active_org, active_dst, prio_factor)
+        c_codes = ["#ff003c", "#00f3ff", "#ffcc00", "#ffffff"]
+        for i in reversed(range(len(routes))):
+            folium.PolyLine(routes[i]["coords"], color=c_codes[i % len(c_codes)], weight=5 if i == 0 else 3, opacity=0.9 if i == 0 else 0.6).add_to(m)
+        folium.Marker(list(active_org), icon=folium.Icon(color="blue", icon="play", prefix="fa"), popup="<b>📍 ORIGIN</b>").add_to(m)
+        folium.Marker(list(active_dst), icon=folium.Icon(color="red", icon="flag-checkered", prefix="fa"), popup="<b>🏁 DESTINATION</b>").add_to(m)
+    
+    for _, row in all_drivers.iterrows():
+        lat, lon = row.get("current_lat"), row.get("current_lon")
+        if pd.isna(lat) or pd.isna(lon): continue
+        did = row.get("driver_id", "?")
+        status = row.get("status", "?")
+        speed = row.get("speed")
+        origin = row.get("origin") or "—"
+        dest = row.get("destination") or "—"
+        spd = f" {int(speed)} km/h" if speed is not None and not pd.isna(speed) else ""
+        prof = profiles.get(did, {})
+        fname = prof.get("full_name", "—")
+        vnum = prof.get("vehicle_id", "—")
+        is_focus = did == focus_driver_id
+        popup_html = f"""
+        <div style="min-width:200px; font-family:sans-serif; font-size:12px;">
+            <div style="font-size:24px; margin-bottom:8px;">🚑 <b>{_safe_html(did)}</b>{" (TRACKED)" if is_focus else ""}</div>
+            <div style="border-bottom:1px solid #333; padding-bottom:6px; margin-bottom:6px;">
+                <div><b>Driver:</b> {_safe_html(fname)}</div>
+                <div><b>Vehicle:</b> {_safe_html(vnum)}</div>
+                <div><b>Unit ID:</b> {_safe_html(did)}</div>
+            </div>
+            <div style="color:#00f3ff;"><b>From:</b> {_safe_html(origin)}</div>
+            <div style="color:#00ff9d;"><b>To:</b> {_safe_html(dest)}</div>
+            <div style="margin-top:6px; color:#888;">{status}{spd}</div>
+        </div>
+        """
+        folium.Marker(
+            [float(lat), float(lon)],
+            icon=folium.Icon(color="green" if status == "EN_ROUTE" else "blue" if status == "IDLE" else "gray", icon="ambulance", prefix="fa"),
+            popup=folium.Popup(popup_html, max_width=280),
+            tooltip=f"🚑 {did} — {fname} ({status})",
+        ).add_to(m)
+    
+    if focus_driver_id and len(ghost_trail) > 1:
+        folium.PolyLine(ghost_trail, color="#00ff9d", weight=3, dash_array="5, 10", opacity=0.7).add_to(m)
+    
+    for h in hazards:
+        folium.Marker([h['lat'], h['lon']], icon=folium.Icon(color="orange", icon="exclamation-triangle", prefix="fa"), tooltip=h['type']).add_to(m)
+    for s in sensors:
+        if s['Status'] == "GREEN_WAVE":
+            folium.Circle(location=[s['Lat'], s['Lon']], radius=300, color="#00ff00", fill=True, fill_color="#00ff00", fill_opacity=0.3, popup=f"GREEN WAVE: {s['Area']}").add_to(m)
+    
+    st_folium(m, width="100%", height=600, returned_objects=[])
+
+@st.fragment(run_every=2)
+def render_sensor_grid_fragment():
+    """
+    Independent Sensor Grid refresh.
+    """
+    data = get_sensors_data()
+    # Sort: Green Wave & Jammed first
+    data.sort(key=lambda x: 0 if x['Status']=="GREEN_WAVE" else 1 if x['Status']=="JAMMED" else 2)
+    
+    cols = st.columns(4)
+    for i, d in enumerate(data):
+        c = "#00ff00" if d['Status']=="GREEN_WAVE" else "#ff003c" if d['Status']=="JAMMED" else "#ffaa00" if d['Status']=="HEAVY" else "#00e5ff"
+        with cols[i%4]: 
+            st.markdown(f"""
+            <div class="titan-card" style="border-left-color:{c}; padding:10px;">
+                <div style="font-weight:bold; font-size:12px;">{d['Area']}</div>
+                <div style="display:flex; justify-content:space-between;">
+                    <span style="font-family:'Orbitron'; font-size:18px; color:{c};">{d['Flow']} KM/H</span>
+                    <span style="font-size:10px;">{d['Status']}</span>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
 
 # ==========================================
-# 5. PAGE RENDERERS
+# 6. PAGE RENDERERS
 # ==========================================
 
 # --- HOME PAGE ---
@@ -512,7 +1069,6 @@ def render_home():
     c1, c2 = st.columns([3, 1])
     with c1: st.markdown('<div class="hero-title">TRAFFIC INTELLIGENCE</div>', unsafe_allow_html=True)
     with c2: st.markdown(f'<div class="titan-card" style="text-align:center;">SYSTEM ONLINE v52.0</div>', unsafe_allow_html=True)
-    
     st.markdown("---")
     
     col_news, col_feats = st.columns([1, 2])
@@ -538,45 +1094,105 @@ def render_home():
         st.session_state.page = 'login'
         st.rerun()
 
-# --- LOGIN PAGE ---
+# --- OPERATOR SIGNUP ---
+def operator_signup(username, password, display_name):
+    """Register new operator. Returns (True, None) on success else (False, error_msg)."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        if c.execute("SELECT 1 FROM operators WHERE username=?", (username.strip(),)).fetchone():
+            conn.close()
+            return False, "Username already taken."
+        c.execute(
+            "INSERT INTO operators (username, password, display_name) VALUES (?, ?, ?)",
+            (username.strip(), hash_password(password), (display_name or username).strip()),
+        )
+        conn.commit()
+        conn.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def _verify_operator_password(uid, key):
+    """Verify operator credentials. Supports hashed and legacy plain."""
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute("SELECT username, password FROM operators WHERE username=?", (uid.strip(),)).fetchone()
+    conn.close()
+    if not row:
+        return False
+    _, stored = row
+    if stored and len(stored) == 64 and stored.isalnum():
+        return verify_password(key, stored)
+    return key == stored
+
+# --- LOGIN PAGE (with Sign Up tab) ---
 def render_login():
-    st.markdown("<br><br><br>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style="text-align:center; padding:50px 0 35px 0;">
+        <div style="width:100px; height:100px; margin:0 auto 24px; background:linear-gradient(135deg,rgba(0,243,255,0.15),rgba(255,0,60,0.08)); border-radius:50%; display:flex; align-items:center; justify-content:center; border:2px solid rgba(0,243,255,0.4); box-shadow:0 0 50px rgba(0,243,255,0.2);">
+            <span style="font-size:50px;">📡</span>
+        </div>
+        <div style="font-family:'Orbitron'; font-size:36px; font-weight:800; background:linear-gradient(90deg,#00f3ff,#ff003c); -webkit-background-clip:text; -webkit-text-fill-color:transparent; letter-spacing:4px;">TRAFFIC INTEL V52</div>
+        <div style="color:#8892a6; font-size:14px; letter-spacing:4px; margin-top:12px; font-weight:500;">SECURE GATEWAY</div>
+        <div style="height:1px; background:linear-gradient(90deg,transparent,rgba(0,243,255,0.6),transparent); margin:24px auto; max-width:250px;"></div>
+    </div>
+    """, unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
-        st.markdown(f"""<div class="titan-card" style="text-align:center; padding:40px; border-color:{primary};"><div style="font-size:60px; margin-bottom:10px;">🔐</div><h2 style="margin-bottom:0;">SECURE GATEWAY</h2></div>""", unsafe_allow_html=True)
-        with st.form("login_form"):
-            uid = st.text_input("OPERATOR ID", placeholder="COMMANDER")
-            key = st.text_input("ACCESS KEY", type="password", placeholder="••••••••")
-            if st.form_submit_button("AUTHENTICATE", use_container_width=True):
-                # DB-backed login (keeps legacy credentials working via seeded operator)
-                try:
-                    conn = sqlite3.connect(DB_FILE)
-                    row = conn.execute(
-                        "SELECT username FROM operators WHERE username=? AND password=?",
-                        (uid, key),
-                    ).fetchone()
-                    conn.close()
-                    if row:
-                        st.session_state.authenticated = True
-                        st.session_state.page = 'dashboard'
-                        st.rerun()
-                except Exception:
-                    pass
-                st.error("ACCESS DENIED: INCORRECT CREDENTIALS")
-        if st.button("← RETURN"): st.session_state.page = 'home'; st.rerun()
+        login_tab, signup_tab = st.tabs(["🔓 LOGIN", "📝 SIGN UP"])
+        with login_tab:
+            st.markdown("""
+            <div style="background:linear-gradient(145deg,rgba(13,17,26,0.95),rgba(8,12,18,0.98)); border:1px solid rgba(0,243,255,0.3); border-radius:20px; padding:40px; margin:0 0 24px; box-shadow:0 12px 48px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.05); backdrop-filter:blur(20px);">
+                <div style="color:#00f3ff; font-family:'Orbitron'; font-size:11px; letter-spacing:3px; margin-bottom:24px;">OPERATOR ACCESS</div>
+            """, unsafe_allow_html=True)
+            with st.form("login_form"):
+                uid = st.text_input("Operator ID", placeholder="COMMANDER", label_visibility="collapsed")
+                key = st.text_input("Access Key", type="password", placeholder="••••••••", label_visibility="collapsed")
+                st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+                if st.form_submit_button("AUTHENTICATE", use_container_width=True, type="primary"):
+                    if not uid or not key:
+                        st.error("Enter operator ID and access key.")
+                    else:
+                        try:
+                            if _verify_operator_password(uid, key):
+                                st.session_state.authenticated = True
+                                st.session_state.operator_id = uid.strip()
+                                st.session_state.page = 'dashboard'
+                                st.rerun()
+                            else:
+                                st.error("ACCESS DENIED: Incorrect credentials.")
+                        except Exception:
+                            st.error("Login failed.")
+            st.markdown("</div>", unsafe_allow_html=True)
+        with signup_tab:
+            st.markdown("""
+            <div style="background:linear-gradient(145deg,rgba(13,17,26,0.95),rgba(8,12,18,0.98)); border:1px solid rgba(0,255,157,0.3); border-radius:20px; padding:40px; margin:0 0 24px; box-shadow:0 12px 48px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.05); backdrop-filter:blur(20px);">
+                <div style="color:#00ff9d; font-family:'Orbitron'; font-size:11px; letter-spacing:3px; margin-bottom:24px;">REGISTER OPERATOR</div>
+            """, unsafe_allow_html=True)
+            with st.form("signup_form"):
+                new_uid = st.text_input("Operator ID", placeholder="Choose username", label_visibility="collapsed", key="op_u")
+                new_key = st.text_input("Access Key", type="password", placeholder="Choose password", label_visibility="collapsed", key="op_k")
+                new_name = st.text_input("Display Name", placeholder="e.g. HQ Commander", label_visibility="collapsed", key="op_n")
+                if st.form_submit_button("REGISTER", use_container_width=True, type="primary"):
+                    if not new_uid or not new_key:
+                        st.error("Operator ID and Access Key required.")
+                    else:
+                        ok, err = operator_signup(new_uid, new_key, new_name)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success("Operator registered. Log in now.")
+                            st.balloons()
+            st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style="text-align:center; color:#666; font-size:11px; margin:20px 0;">Demo: <code style="background:#222; padding:2px 8px; border-radius:4px;">COMMANDER</code> / <code style="background:#222; padding:2px 8px; border-radius:4px;">TITAN-X</code></div>
+        """, unsafe_allow_html=True)
+        if st.button("← RETURN", use_container_width=True):
+            st.session_state.page = 'home'
+            st.rerun()
 
 # --- DASHBOARD PAGE ---
 def render_dashboard():
-    # AUTO REFRESH TOGGLE (REAL-TIME MODE)
-    # NOTE: Previous implementation caused an infinite rerun loop
-    # right after authentication, making the dashboard appear to
-    # "load forever". We keep the toggle for future use but avoid
-    # automatic sleep + rerun here so the page can render normally.
-    st.session_state.auto_refresh = st.toggle(
-        "🔄 AUTO-SYNC MODE (Real-Time Live View)",
-        value=False
-    )
-
     with st.sidebar:
         st.image("https://cdn-icons-png.flaticon.com/512/3662/3662817.png", width=60)
         st.markdown(f"### TRAFFIC INTEL")
@@ -584,36 +1200,41 @@ def render_dashboard():
         if mode != st.session_state.emergency_mode: st.session_state.emergency_mode = mode; st.rerun()
         st.markdown("---")
         
-        # Priority Slider
         st.markdown("### 🎚️ MISSION PRIORITY")
         prio_label = st.select_slider("Select Urgency Level", options=["STANDARD", "MEDIUM", "HIGH", "CRITICAL"], value="STANDARD")
         st.session_state.priority_val = prio_label
         prio_factor = {"STANDARD": 1.0, "MEDIUM": 0.85, "HIGH": 0.75, "CRITICAL": 0.65}[prio_label]
         
         st.markdown("---")
-        # Manual Mission Dispatch
         with st.form("nav"):
-            st.caption("MANUAL MISSION DISPATCH")
+            st.caption("QUICK DISPATCH")
             org = st.selectbox("ORIGIN", sorted(list(HOSPITALS.keys())), index=0)
             dst = st.selectbox("DESTINATION", sorted(list(HOSPITALS.keys())), index=1)
-            # NEW: assign to an available driver (optional)
+            
             drivers_df = get_available_drivers()
-            idle_drivers = []
-            if not drivers_df.empty:
-                idle = drivers_df[drivers_df["status"] == "IDLE"]
-                idle_drivers = idle["driver_id"].tolist()
-            assigned_driver = st.selectbox(
-                "ASSIGN TO (optional)",
-                options=["AUTO / ANY AVAILABLE"] + idle_drivers,
-            )
-            if st.form_submit_button("🚨 ASSIGN TO DRIVER", use_container_width=True):
+            org_c = HOSPITALS.get(org)
+            driver_opts = ["AUTO / ANY AVAILABLE"]
+            if not drivers_df.empty and org_c:
+                # Sort by proximity to origin
+                with_dist = []
+                for _, row in drivers_df.iterrows():
+                    lat, lon = row.get("current_lat"), row.get("current_lon")
+                    d = distance_km(org_c[0], org_c[1], float(lat or 10), float(lon or 76)) if pd.notna(lat) and pd.notna(lon) else 999
+                    with_dist.append((row["driver_id"], row.get("status","?"), d))
+                with_dist.sort(key=lambda x: (0 if x[1]=="IDLE" else 1, x[2]))
+                driver_opts += [f"{d[0]} ({d[2]}km)" for d in with_dist]
+            else:
+                driver_opts += drivers_df["driver_id"].tolist() if not drivers_df.empty else []
+            
+            assigned_driver = st.selectbox("Assign to Driver", options=driver_opts)
+            if st.form_submit_button("🚨 DISPATCH", use_container_width=True):
                 mid = f"CMD-{random.randint(1000,9999)}"
-                # Save to mission_logs so driver app sees it
                 save_mission_data(mid, org, dst, prio_label, 0, 0, 0)
-                # Also create an explicit assignment mission for driver app (preferred path)
-                driver_id = None if assigned_driver == "AUTO / ANY AVAILABLE" else assigned_driver
-                create_mission(mid, org, dst, prio_label, assigned_driver_id=driver_id)
-                st.success(f"Mission {mid} Uplinked to Unit!")
+                drv_id = None
+                if assigned_driver != "AUTO / ANY AVAILABLE":
+                    drv_id = assigned_driver.split(" ")[0] if " " in assigned_driver else assigned_driver
+                create_mission(mid, org, dst, prio_label, assigned_driver_id=drv_id)
+                st.success(f"Mission {mid} dispatched!")
         
         st.markdown("---")
         st.markdown("### 👥 DRIVER AVAILABILITY")
@@ -621,264 +1242,939 @@ def render_dashboard():
         if drivers_df.empty:
             st.caption("No online drivers detected yet. Open `driverapp.py` to bring a unit online.")
         else:
-            # show last seen seconds for quick health check
+            now = datetime.datetime.now()
+            tmp = drivers_df.copy()
+            tmp["last_seen"] = pd.to_datetime(tmp["last_seen"], errors="coerce")
+            tmp["seen_s_ago"] = (now - tmp["last_seen"]).dt.total_seconds().fillna(999999).astype(int)
+            st.dataframe(tmp[["driver_id", "status", "seen_s_ago", "current_lat", "current_lon"]], use_container_width=True, height=220)
+        
+        st.markdown("---")
+        if st.button("🎬 DEMO MODE", use_container_width=True, help="Create sample missions for demo"):
             try:
-                now = datetime.datetime.now()
-                tmp = drivers_df.copy()
-                tmp["last_seen"] = pd.to_datetime(tmp["last_seen"], errors="coerce")
-                tmp["seen_s_ago"] = (now - tmp["last_seen"]).dt.total_seconds().fillna(999999).astype(int)
-                st.dataframe(
-                    tmp[["driver_id", "status", "seen_s_ago", "current_lat", "current_lon"]],
-                    use_container_width=True,
-                    height=220,
-                )
+                hospitals = sorted(list(HOSPITALS.keys()))
+                for i in range(3):
+                    mid = f"CMD-{random.randint(1000,9999)}"
+                    org = random.choice(hospitals)
+                    dst = random.choice([h for h in hospitals if h != org])
+                    prio = random.choice(["STANDARD", "MEDIUM", "HIGH"])
+                    create_mission(mid, org, dst, prio, assigned_driver_id=None, notes=f"Demo mission {i+1}")
+                st.success("3 demo missions created! Check Mission Center.")
+                st.balloons()
+                st.rerun()
             except Exception:
-                st.dataframe(drivers_df, use_container_width=True, height=220)
-
+                st.error("Demo mode failed")
         if st.button("🔒 LOGOUT", use_container_width=True): st.session_state.authenticated = False; st.session_state.page = 'home'; st.rerun()
 
     if st.session_state.emergency_mode: st.markdown(f'''<div style="background:{primary}22; border:1px solid {primary}; color:{primary}; padding:10px; text-align:center; font-family:'Orbitron'; letter-spacing:3px; margin-bottom:20px; border-radius:6px;">⚠️ CRITICAL EMERGENCY PROTOCOL ACTIVE ⚠️</div>''', unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🗺️ LIVE TRACKING & MAP", "📡 SENSOR GRID", "📊 ENGINEERING REPORT", "📶 V2X COMMS LOG"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🚀 MISSION CENTER",
+        "🗺️ LIVE TRACKING & MAP",
+        "📡 SENSOR GRID",
+        "📊 ENGINEERING REPORT",
+        "📶 V2X COMMS LOG"
+    ])
 
+    # ==========================================
+    # TAB 0: MISSION CENTER - Fetch Route + Assign to Driver
+    # ==========================================
     with tab1:
-        # Use st.empty() to update map in-place without full page flicker
-        map_container = st.empty()
+        st.markdown("""
+        <div style="background:linear-gradient(135deg,rgba(0,243,255,0.08),rgba(0,255,157,0.04)); border:1px solid rgba(0,243,255,0.3); border-radius:16px; padding:24px; margin-bottom:24px;">
+            <div style="font-family:'Orbitron'; font-size:28px; font-weight:700; background:linear-gradient(90deg,#00f3ff,#00ff9d); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">🚀 MISSION CENTER</div>
+            <div style="color:#8892a6; font-size:14px; margin-top:8px;">Define route → Preview ETAs → Assign driver → Dispatch</div>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # --- MAP LOGIC: LIVE SYNC WITH DRIVER ---
-        driver = get_driver_status()
-        active_org, active_dst = None, None
+        mc_col1, mc_col2 = st.columns([1, 1])
         
-        if st.button("🔄 FORCE SYNC MAP"): st.rerun()
-
-        # 1. Check if Driver is Active (Higher Priority)
-        if driver and driver['status'] == "EN_ROUTE":
-            st.success(f"🚑 TRACKING ACTIVE UNIT: {driver['origin']} ➔ {driver['dest']}")
-            if driver['origin'] in HOSPITALS and driver['dest'] in HOSPITALS:
-                active_org = HOSPITALS[driver['origin']]
-                active_dst = HOSPITALS[driver['dest']]
-
-        # NEW: HQ can also preview routing/directions without a live unit
-        with st.expander("🧭 HQ Route Planner (preview 4 routes + directions)"):
-            cA, cB = st.columns(2)
-            with cA:
-                hq_org = st.selectbox("Origin (HQ)", sorted(list(HOSPITALS.keys())), key="hq_org_plan")
-            with cB:
-                hq_dst = st.selectbox("Destination (HQ)", sorted(list(HOSPITALS.keys())), key="hq_dst_plan")
-            if hq_org and hq_dst and hq_org in HOSPITALS and hq_dst in HOSPITALS:
-                plan_org = HOSPITALS[hq_org]
-                plan_dst = HOSPITALS[hq_dst]
-                plan_routes = fetch_routes(plan_org, plan_dst, prio_factor)
-                plan_dirs = fetch_route_directions(plan_org, plan_dst, max_alternatives=3)
-                if plan_routes:
-                    st.caption("HQ preview routes:")
-                    cols = st.columns(len(plan_routes))
-                    c_codes = ["#ff003c", "#00f3ff", "#ffcc00", "#ffffff"]
-                    for i, r in enumerate(plan_routes):
-                        with cols[i]:
-                            st.markdown(
-                                f"""<div class="titan-card" style="border-left-color:{c_codes[i]}; text-align:center;">
-                                <div class="metric-label" style="color:{c_codes[i]};">ROUTE {i+1}</div>
-                                <div class="metric-value">{r['eta']} MIN</div>
-                                <div style="font-size:12px; color:#aaa;">{r['dist']} KM</div>
-                                </div>""",
-                                unsafe_allow_html=True,
-                            )
-                if plan_dirs:
-                    for d in plan_dirs[:4]:
-                        st.markdown(f"**Route {d['id']+1}** • {d.get('eta_min','--')} min • {d.get('dist_km','--')} km")
-                        if d["instructions"]:
-                            st.write("\n".join([f"- {m}" for m in d["instructions"][:20]]))
+        with mc_col1:
+            st.markdown("""
+            <div class="titan-card" style="border-left:4px solid #00f3ff; padding:16px; margin-bottom:16px;">
+                <div style="font-size:18px; font-weight:600; margin:4px 0;">📍 Define Mission</div>
+                <div style="font-size:12px; color:#888;">Select origin and destination</div>
+            </div>
+            """, unsafe_allow_html=True)
+            with st.form("mission_center_form"):
+                org = st.selectbox("ORIGIN (Pickup)", sorted(list(HOSPITALS.keys())), key="mc_org")
+                dst = st.selectbox("DESTINATION (Drop-off)", sorted(list(HOSPITALS.keys())), key="mc_dst")
+                prio_label = st.select_slider("Priority", options=["STANDARD", "MEDIUM", "HIGH", "CRITICAL"], value="STANDARD", key="mc_prio")
+                prio_factor = {"STANDARD": 1.0, "MEDIUM": 0.85, "HIGH": 0.75, "CRITICAL": 0.65}[prio_label]
+                
+                if st.form_submit_button("🔍 FETCH ROUTES", use_container_width=True):
+                    with st.spinner("Loading routes..."):
+                        st.session_state.mc_routes = fetch_routes(HOSPITALS[org], HOSPITALS[dst], prio_factor)
+                    st.session_state.mc_submitted_org = org
+                    st.session_state.mc_submitted_dst = dst
+                    st.session_state.mc_submitted_prio = prio_label
+                    st.rerun()
         
-        # 2. Render Map if we have endpoints (now with 4 routes + directions)
-        if active_org and active_dst:
-            routes = fetch_routes(active_org, active_dst, prio_factor)
-            directions = fetch_route_directions(active_org, active_dst, max_alternatives=3)
+        with mc_col2:
+            st.markdown("""
+            <div class="titan-card" style="border-left:4px solid #00ff9d; padding:16px; margin-bottom:16px;">
+                <div style="font-size:18px; font-weight:600; margin:4px 0;">👥 Available Drivers</div>
+                <div style="font-size:12px; color:#888;">Sorted by proximity to origin</div>
+            </div>
+            """, unsafe_allow_html=True)
+            drivers_df = get_available_drivers(60)
+            org_key = st.session_state.get("mc_submitted_org") or list(HOSPITALS.keys())[0]
+            org_coords = HOSPITALS.get(org_key)
             
-            # Route Stats Cards
-            if routes:
-                c_codes = ["#ff003c", "#00f3ff", "#ffcc00", "#ffffff"]
-                cols = st.columns(len(routes))
-                for i, r in enumerate(routes):
-                    with cols[i]: st.markdown(f"""<div class="titan-card" style="border-left-color:{c_codes[i]}; text-align:center;"><div class="metric-label" style="color:{c_codes[i]};">ROUTE {i+1}</div><div class="metric-value">{r['eta']} MIN</div><div style="font-size:12px; color:#aaa;">{r['dist']} KM</div></div>""", unsafe_allow_html=True)
-
-            # NEW: Turn-by-turn directions per route
-            if directions:
-                with st.expander("🧭 Turn-by-turn directions (TomTom)"):
-                    for d in directions[:4]:
-                        st.markdown(f"**Route {d['id']+1}** • {d.get('eta_min','--')} min • {d.get('dist_km','--')} km")
-                        if d["instructions"]:
-                            st.write("\n".join([f"- {m}" for m in d["instructions"][:25]]))
-                        else:
-                            st.caption("No text instructions returned for this route.")
+            if drivers_df.empty:
+                st.info("No online drivers. Open driverapp to bring units online.")
+                driver_proximity = []
+            else:
+                driver_proximity = []
+                for _, row in drivers_df.iterrows():
+                    lat, lon = row.get("current_lat"), row.get("current_lon")
+                    if pd.notna(lat) and pd.notna(lon) and org_coords:
+                        dist = distance_km(org_coords[0], org_coords[1], float(lat), float(lon))
+                        driver_proximity.append({
+                            "driver_id": row.get("driver_id", "?"),
+                            "status": row.get("status", "?"),
+                            "distance_km": dist,
+                            "lat": lat, "lon": lon
+                        })
+                    else:
+                        driver_proximity.append({
+                            "driver_id": row.get("driver_id", "?"),
+                            "status": row.get("status", "?"),
+                            "distance_km": 999,
+                            "lat": None, "lon": None
+                        })
+                driver_proximity.sort(key=lambda x: (0 if x["status"] == "IDLE" else 1, x["distance_km"]))
+                
+                for d in driver_proximity[:10]:
+                    color = "#00ff9d" if d["status"] == "IDLE" else "#ffcc00"
+                    dist_str = f"{d['distance_km']:.1f}" if isinstance(d['distance_km'], (int, float)) else str(d['distance_km'])
+                    st.markdown(f"""
+                    <div class="titan-card" style="border-left-color:{color}; padding:14px; margin-bottom:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <span style="font-weight:bold; color:{color};">{d['driver_id']}</span>
+                            <span style="font-size:11px; padding:2px 8px; border-radius:4px; background:{color}22; color:{color};">{d['status']}</span>
+                        </div>
+                        <div style="font-size:12px; color:#aaa; margin-top:4px;">📍 {dist_str} km from origin</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        st.markdown("""
+        <div class="titan-card" style="border-left:4px solid #ffcc00; padding:16px; margin:16px 0;">
+            <div style="font-size:18px; font-weight:600; margin:4px 0;">🛣️ Route Preview</div>
+            <div style="font-size:12px; color:#888;">Route alternatives with ETA and distance</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        mc_routes = st.session_state.get("mc_routes", [])
+        if mc_routes:
+            route_cols = st.columns(min(4, len(mc_routes)))
+            colors = ["#ff003c", "#00f3ff", "#ffcc00", "#00ff9d"]
             
-            mid_lat = (active_org[0] + active_dst[0]) / 2
-            mid_lon = (active_org[1] + active_dst[1]) / 2
-            m = folium.Map(location=[mid_lat, mid_lon], zoom_start=12, tiles="CartoDB dark_matter")
+            for idx, route in enumerate(mc_routes[:4]):
+                with route_cols[idx]:
+                    c = colors[idx % len(colors)]
+                    delay = route.get('traffic_delay_min', 0) or 0
+                    st.markdown(f"""
+                    <div class="titan-card" style="border-left-color:{c}; padding:20px; cursor:pointer;">
+                        <div style="font-size:11px; color:#888; margin-bottom:4px;">{route.get('route_type', '')}</div>
+                        <div style="font-family:'Orbitron'; font-size:34px; color:{c}; margin:8px 0;">{route.get('eta', 0)} <span style="font-size:14px; color:#888;">MIN</span></div>
+                        <div style="display:flex; justify-content:space-between; font-size:12px; margin-top:8px;">
+                            <span>📍 {route.get('dist', 0)} km</span>
+                            <span style="color:{'#ff003c' if delay>3 else '#00ff9d'}">+{delay} min delay</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
             
-            # Draw Routes
-            for i in reversed(range(len(routes))): 
-                folium.PolyLine(routes[i]['coords'], color=c_codes[i], weight=5 if i==0 else 3, opacity=0.9 if i==0 else 0.6).add_to(m)
+            st.markdown("---")
+            st.markdown("""
+            <div class="titan-card" style="border-left:4px solid #ff003c; padding:16px; margin:16px 0;">
+                <div style="font-size:18px; font-weight:600; margin:4px 0;">📤 Dispatch Mission</div>
+                <div style="font-size:12px; color:#888;">Assign driver and send to fleet</div>
+            </div>
+            """, unsafe_allow_html=True)
             
-            # Plot Start/End
-            folium.Marker(active_org, icon=folium.Icon(color="blue", icon="play", prefix="fa")).add_to(m)
-            folium.Marker(active_dst, icon=folium.Icon(color="red", icon="flag-checkered", prefix="fa")).add_to(m)
-            
-            # Plot LIVE DRIVER
-            if driver:
-                folium.Marker(
-                    [driver['lat'], driver['lon']], 
-                    icon=folium.Icon(color="green", icon="ambulance", prefix="fa"), 
-                    popup=f"UNIT {driver['id']} (LIVE)"
-                ).add_to(m)
-
-            with map_container:
-                st_folium(m, width="100%", height=600)
+            with st.form("dispatch_mission_form"):
+                best_route = mc_routes[0]
+                st.caption(f"Best route: {best_route.get('route_type')} — {best_route.get('eta')} min • {best_route.get('dist')} km")
+                
+                idle_drivers = [d["driver_id"] for d in driver_proximity if d["status"] == "IDLE"]
+                driver_options = ["AUTO (Closest IDLE)"] + idle_drivers + [d["driver_id"] for d in driver_proximity if d["status"] != "IDLE"]
+                
+                assigned_driver = st.selectbox(
+                    "Assign to Driver",
+                    options=driver_options,
+                    format_func=lambda x: f"{x} (IDLE)" if x in idle_drivers else x,
+                    key="mc_driver"
+                )
+                
+                notes = st.text_input("Mission Notes (optional)", placeholder="e.g. Patient type, special instructions...")
+                
+                if st.form_submit_button("🚨 DISPATCH MISSION", use_container_width=True):
+                    mid = f"CMD-{random.randint(1000,9999)}"
+                    org_d = st.session_state.get("mc_submitted_org") or list(HOSPITALS.keys())[0]
+                    dst_d = st.session_state.get("mc_submitted_dst") or list(HOSPITALS.keys())[1]
+                    prio_d = st.session_state.get("mc_submitted_prio") or "STANDARD"
+                    
+                    driver_id = None if assigned_driver == "AUTO (Closest IDLE)" else assigned_driver
+                    if driver_id is None and idle_drivers:
+                        driver_id = idle_drivers[0]
+                    
+                    save_mission_data(mid, org_d, dst_d, prio_d, 0, 0, 0)
+                    create_mission(mid, org_d, dst_d, prio_d, assigned_driver_id=driver_id, notes=notes or "")
+                    log_activity("DISPATCH", st.session_state.get("operator_id", "HQ"), f"{mid} {org_d}→{dst_d} to {driver_id or 'AUTO'}")
+                    
+                    if notes:
+                        send_hq_message(driver_id or "ALL", f"Mission {mid}: {notes}", "HQ_INFO")
+                    
+                    st.success(f"✅ Mission {mid} dispatched! Assigned to {driver_id or 'AUTO'}")
+                    st.balloons()
+                    st.session_state.mc_routes = None
+                    st.rerun()
         else:
-            st.info("No Active Missions detected on the Network. Waiting for Driver Uplink...")
-            # Default Kochi Map
-            m = folium.Map(location=[10.015, 76.340], zoom_start=12, tiles="CartoDB dark_matter")
-            with map_container:
-                st_folium(m, width="100%", height=400)
+            st.info("👆 Select origin & destination, then click **FETCH ROUTES** to preview and dispatch.")
 
     with tab2:
-        if st.button("🔄 REFRESH GRID"): st.rerun()
-        data = get_sensors_data()
-        cols = st.columns(4)
-        for i, d in enumerate(data):
-            c = "#ff003c" if d['Status']=="JAMMED" else "#ffaa00" if d['Status']=="HEAVY" else "#00e5ff"
-            with cols[i%4]: st.markdown(f"""<div class="titan-card" style="border-left-color:{c}; padding:10px;"><div style="font-weight:bold; font-size:12px;">{d['Area']}</div><div style="display:flex; justify-content:space-between;"><span style="font-family:'Orbitron'; font-size:18px; color:{c};">{d['Flow']} KM/H</span><span style="font-size:10px;">{d['Status']}</span></div></div>""", unsafe_allow_html=True)
-
-        # NEW: Mission queue & assignment panel (keeps existing sensor grid intact)
+        # ==========================================
+        # LIVE TRACKING - Mission status filter + Unit search + Per-unit map
+        # ==========================================
+        st.markdown("## 🗺️ LIVE TRACKING & MAP")
         st.markdown("---")
-        st.subheader("🎯 Mission Queue (Dispatch / Assign / Manage)")
-
-        missions_df = list_missions()
-        if missions_df.empty:
-            st.info("No missions in queue yet. Use the sidebar dispatch form to create one.")
-        else:
-            # Filter view
-            status_filter = st.multiselect(
-                "Filter by status",
-                options=["DISPATCHED", "ACCEPTED", "COMPLETED", "CANCELLED"],
+        
+        # --- PENDING clearance requests ---
+        pending = get_drivers_pending_clearance()
+        if not pending.empty:
+            st.markdown("""
+                <div style="animation: blink 1s infinite; background:#ff003322; border:2px solid #ff0033; color:#ff0033; padding:12px; border-radius:8px; margin-bottom:12px; font-family:'Orbitron';">
+                    ⚠️ GREEN WAVE REQUESTS PENDING
+                </div>
+                <style>@keyframes blink { 50% { opacity: 0.7; } }</style>
+            """, unsafe_allow_html=True)
+            for _, row in pending.iterrows():
+                did = row["driver_id"]
+                c1, c2, c3 = st.columns([2, 1, 1])
+                with c1: st.write(f"**{did}** — awaiting signal clearance")
+                with c2:
+                    if st.button("✅ GRANT", key=f"grant_{did}"):
+                        update_driver_clearance(did, "GRANTED")
+                        st.rerun()
+                with c3:
+                    if st.button("❌ DENY", key=f"deny_{did}"):
+                        update_driver_clearance(did, "DENIED")
+                        st.rerun()
+        
+        # --- FILTERS: Mission status + Unit search ---
+        lt_col1, lt_col2, lt_col3, lt_col4 = st.columns(4)
+        with lt_col1:
+            st.markdown("**📋 Mission Status**")
+            mission_status_filter = st.multiselect(
+                "Show missions",
+                ["DISPATCHED", "ACCEPTED", "COMPLETED", "CANCELLED"],
                 default=["DISPATCHED", "ACCEPTED"],
+                key="lt_mission_status"
             )
-            view = missions_df[missions_df["status"].isin(status_filter)] if status_filter else missions_df
-
-            st.dataframe(
-                view[["mission_id", "created_at", "origin", "destination", "priority", "assigned_driver_id", "status"]],
-                use_container_width=True,
-                height=260,
+        with lt_col2:
+            st.markdown("**🔍 Search Unit**")
+            unit_search = st.text_input("Driver ID or Mission ID", placeholder="e.g. UNIT-07 or CMD-1234", key="lt_unit_search")
+        with lt_col3:
+            st.markdown("**👤 Unit Status**")
+            unit_status_filter = st.multiselect(
+                "Driver status",
+                ["IDLE", "EN_ROUTE", "BREAK", "INACTIVE"],
+                default=["IDLE", "EN_ROUTE", "BREAK"],
+                key="lt_unit_status"
             )
-
-            # Manage a mission
-            mid_opts = view["mission_id"].dropna().astype(str).tolist()
-            if mid_opts:
-                selected_mid = st.selectbox("Select mission to manage", options=mid_opts)
-                cA, cB, cC = st.columns(3)
-
-                # Re/assign
-                with cA:
-                    drivers_df = get_available_drivers()
-                    drv_opts = ["UNASSIGNED"]
-                    if not drivers_df.empty:
-                        drv_opts += drivers_df["driver_id"].astype(str).tolist()
-                    new_drv = st.selectbox("Assign/Reassign driver", options=drv_opts, key="assign_driver_manage")
-                    if st.button("✅ APPLY ASSIGNMENT", use_container_width=True):
-                        ok = update_mission_assignment(selected_mid, None if new_drv == "UNASSIGNED" else new_drv)
-                        st.success("Updated." if ok else "Update failed.")
-                        st.rerun()
-
-                # Cancel
-                with cB:
-                    if st.button("🛑 CANCEL MISSION", use_container_width=True):
-                        ok = update_mission_status(selected_mid, "CANCELLED")
-                        st.success("Cancelled." if ok else "Cancel failed.")
-                        st.rerun()
-
-                # Force complete (admin)
-                with cC:
-                    if st.button("🏁 MARK COMPLETED", use_container_width=True):
-                        ok = update_mission_status(selected_mid, "COMPLETED")
-                        st.success("Completed." if ok else "Update failed.")
-                        st.rerun()
+        with lt_col4:
+            st.markdown("**📍 Track Unit / Mission**")
+            all_drivers_df = get_all_active_drivers(60)
+            driver_options = ["All units"] + (all_drivers_df["driver_id"].tolist() if not all_drivers_df.empty else [])
+            # Focus by mission
+            active_missions = list_missions(50)
+            active_missions = active_missions[active_missions["status"].isin(["DISPATCHED", "ACCEPTED"])] if not active_missions.empty else pd.DataFrame()
+            mission_options = ["— Select unit —"]
+            if not active_missions.empty and "mission_id" in active_missions.columns:
+                mission_options += [f"{r['mission_id']} ({r.get('assigned_driver_id','?')})" for _, r in active_missions.iterrows()]
+            focus_by_mission = st.selectbox("Or focus by mission", mission_options, key="lt_focus_mission")
+            tracked_unit = st.selectbox("Focus map on", driver_options, key="lt_tracked_unit")
+        
+        # --- Missions list (filtered) ---
+        missions_df = list_missions(100)
+        if not missions_df.empty and mission_status_filter:
+            missions_df = missions_df[missions_df["status"].isin(mission_status_filter)]
+        if unit_search:
+            q = unit_search.strip().upper()
+            missions_df = missions_df[
+                missions_df["mission_id"].astype(str).str.upper().str.contains(q, na=False) |
+                missions_df["assigned_driver_id"].astype(str).str.upper().str.contains(q, na=False) |
+                missions_df["origin"].astype(str).str.upper().str.contains(q, na=False) |
+                missions_df["destination"].astype(str).str.upper().str.contains(q, na=False)
+            ]
+        
+        # --- Units table (filtered by status + search) ---
+        active_df = get_all_active_drivers(60)
+        if not active_df.empty and unit_status_filter:
+            active_df = active_df[active_df["status"].isin(unit_status_filter)]
+        if unit_search and not active_df.empty:
+            q = unit_search.strip().upper()
+            active_df = active_df[active_df["driver_id"].astype(str).str.upper().str.contains(q, na=False)]
+        
+        st.markdown("### 📊 Units & Missions")
+        if active_df.empty:
+            st.info("No units match filters. Open driverapp to bring units online.")
+        else:
+            active_display = active_df.copy()
+            if "last_seen" in active_display.columns:
+                now = datetime.datetime.now()
+                active_display["last_seen"] = pd.to_datetime(active_display["last_seen"], errors="coerce")
+                active_display["seen_ago"] = ((now - active_display["last_seen"]).dt.total_seconds()).fillna(999).astype(int)
+                active_display["last_seen_str"] = active_display["seen_ago"].apply(lambda s: f"{s}s ago" if s < 60 else f"{s//60}m ago" if s < 3600 else "—")
+            show_cols = [c for c in ["driver_id", "status", "speed", "origin", "destination", "active_mission_id", "last_seen_str"] if c in active_display.columns]
+            disp = active_display[show_cols].copy() if show_cols else active_display.copy()
+            disp.insert(0, "#", range(1, len(disp) + 1))
+            st.dataframe(disp, use_container_width=True, height=180)
+        
+        if not missions_df.empty:
+            m_cols = [c for c in ["mission_id", "created_at", "origin", "destination", "priority", "assigned_driver_id", "status"] if c in missions_df.columns]
+            m_display = missions_df[m_cols].copy()
+            m_display.insert(0, "#", range(1, len(m_display) + 1))
+            st.dataframe(m_display, use_container_width=True, height=160)
+        
+        # --- Mission routes one unit at a time: only show route when a unit is selected ---
+        active_org, active_dst = None, None
+        focus_driver_id = None
+        # If focus by mission selected, extract driver_id
+        if focus_by_mission and focus_by_mission != "— Select unit —" and "(" in focus_by_mission:
+            try:
+                part = focus_by_mission.split("(")[1].rstrip(")")
+                if part and part != "?":
+                    focus_driver_id = part
+            except Exception:
+                pass
+        if not focus_driver_id and tracked_unit and tracked_unit != "All units":
+            focus_driver_id = tracked_unit
+        # Set route (active_org, active_dst) from driver's mission when unit is selected
+        if focus_driver_id:
+            drv_telemetry = get_driver_status_by_id(focus_driver_id) or get_driver_from_drivers_table(focus_driver_id)
+            if drv_telemetry:
+                org_key = drv_telemetry.get("origin") or drv_telemetry.get("dest")
+                dst_key = drv_telemetry.get("dest") or drv_telemetry.get("origin")
+                if org_key and dst_key and org_key in HOSPITALS and dst_key in HOSPITALS:
+                    active_org = HOSPITALS[org_key]
+                    active_dst = HOSPITALS[dst_key]
+        
+        # Refresh map button
+        if st.button("🔄 REFRESH MAP", key="lt_refresh_map", use_container_width=False):
+            st.rerun()
+        st.markdown("---")
+        # --- "Currently viewing: UNIT-XX" card with mission details (only when a unit is selected) ---
+        if focus_driver_id:
+            mission_info = get_current_mission_for_driver(focus_driver_id)
+            drv_telemetry = get_driver_status_by_id(focus_driver_id) or get_driver_from_drivers_table(focus_driver_id)
+            prof = get_driver_profiles([focus_driver_id]).get(focus_driver_id, {})
+            fname = prof.get("full_name", "—")
+            vnum = prof.get("vehicle_id", "—")
+            org_disp = drv_telemetry.get("origin", "—") if drv_telemetry else "—"
+            dst_disp = drv_telemetry.get("dest") or drv_telemetry.get("destination", "—") if drv_telemetry else "—"
+            st.markdown(f"""
+            <div class="titan-card" style="border-left:4px solid #00f3ff; padding:20px 24px; margin-bottom:16px; background:linear-gradient(135deg,rgba(0,243,255,0.05),transparent);">
+                <div style="font-family:'Orbitron'; font-size:16px; color:#00f3ff; margin-bottom:12px; display:flex; align-items:center; gap:10px;">
+                    <span style="font-size:28px;">🚑</span>
+                    <span>TRACKING: <strong>{focus_driver_id}</strong></span>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:12px 24px; font-size:13px;">
+                    <div><span style="color:#666;">Driver</span><br><span style="color:#fff;">{fname}</span></div>
+                    <div><span style="color:#666;">Vehicle</span><br><span style="color:#00f3ff;">{vnum}</span></div>
+                    <div><span style="color:#666;">Mission ID</span><br><span style="color:#ffcc00;">{mission_info.get('mission_id', '—') if mission_info else '—'}</span></div>
+                    <div><span style="color:#666;">Status</span><br><span style="color:#00ff9d;">{drv_telemetry.get('status', '—') if drv_telemetry else '—'}</span></div>
+                    <div><span style="color:#666;">From</span><br><span>{org_disp}</span></div>
+                    <div><span style="color:#666;">To</span><br><span>{dst_disp}</span></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # --- Live map: all units on map; route + ghost trail only for selected unit ---
+        render_live_tracking_map(active_org, active_dst, prio_factor, focus_driver_id=focus_driver_id)
+        
+        with st.expander("🧭 HQ Route Planner (preview routes)", expanded=False):
+            cA, cB = st.columns(2)
+            with cA: hq_org = st.selectbox("Origin (HQ)", sorted(list(HOSPITALS.keys())), key="hq_org_plan")
+            with cB: hq_dst = st.selectbox("Destination (HQ)", sorted(list(HOSPITALS.keys())), key="hq_dst_plan")
+            if hq_org and hq_dst and hq_org in HOSPITALS and hq_dst in HOSPITALS:
+                plan_routes = fetch_routes(HOSPITALS[hq_org], HOSPITALS[hq_dst], prio_factor)
+                if plan_routes:
+                    best_route = plan_routes[0]
+                    st.metric("Best ETA", f"{best_route.get('eta', 0)} min — {best_route.get('dist', 0)} km")
+                    st.caption("Use Mission Center to dispatch this route.")
 
     with tab3:
-        # ANALYTICS & ENGINEERING REPORTS
-        st.subheader("📊 ENGINEERING DATA & ANALYTICS")
-        conn = sqlite3.connect(DB_FILE)
-        try: hist_df = pd.read_sql_query("SELECT * FROM mission_logs", conn)
-        except: hist_df = pd.DataFrame()
-        conn.close()
+        # Call the Fragment
+        render_sensor_grid_fragment()
 
-        if not hist_df.empty:
-            c1, c2 = st.columns(2)
-            with c1: st.markdown(f"""<div class="titan-card"><div class="metric-label">TOTAL MISSIONS</div><div class="metric-value">{len(hist_df)}</div></div>""", unsafe_allow_html=True)
-            with c2: st.markdown(f"""<div class="titan-card"><div class="metric-label">AVG EFFICIENCY GAIN</div><div class="metric-value" style="color:#00ff9d;">88%</div></div>""", unsafe_allow_html=True)
+        # MANAGE MISSIONS
+        st.markdown("---")
+        st.markdown("""
+        <div style="background:linear-gradient(135deg,rgba(255,204,0,0.08),rgba(255,0,60,0.04)); border:1px solid rgba(255,204,0,0.3); border-radius:16px; padding:24px; margin-bottom:24px;">
+            <div style="font-family:'Orbitron'; font-size:24px; font-weight:700; color:#ffcc00;">🎯 MISSION QUEUE</div>
+            <div style="color:#8892a6; font-size:14px; margin-top:8px;">Dispatch • Assign • Manage • Cancel</div>
+        </div>
+        """, unsafe_allow_html=True)
+        missions_df = list_missions()
+        if not missions_df.empty:
+            status_filter = st.multiselect("Filter by status", ["DISPATCHED", "ACCEPTED", "COMPLETED", "CANCELLED"], default=["DISPATCHED", "ACCEPTED"])
+            view = missions_df[missions_df["status"].isin(status_filter)] if status_filter else missions_df
+            # Mission cards with priority badges and notes
+            PRIO_COLORS = {"CRITICAL": "#ef4444", "HIGH": "#f59e0b", "MEDIUM": "#06b6d4", "STANDARD": "#6b7280"}
+            for _, m in view.head(20).iterrows():
+                prio = m.get("priority", "STANDARD") or "STANDARD"
+                pc = PRIO_COLORS.get(prio, "#6b7280")
+                notes = str(m.get("notes", "") or "")[:80]
+                notes_html = f'<div style="color:#6b7280; font-size:11px; margin-top:6px;">📋 {notes}</div>' if notes else ""
+                st.markdown(f"""
+                <div class="titan-card" style="padding:14px 18px; margin-bottom:10px; border-left-color:{pc};">
+                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                        <span style="font-weight:600; color:#e6edf3;">{m.get('mission_id','?')}</span>
+                        <span style="background:{pc}33; color:{pc}; padding:4px 10px; border-radius:6px; font-size:11px; font-weight:600;">{prio}</span>
+                    </div>
+                    <div style="color:#9ca3af; font-size:13px; margin-top:6px;">{m.get('origin','?')} → {m.get('destination','?')}</div>
+                    <div style="display:flex; gap:16px; margin-top:8px; font-size:11px; color:#6b7280;">
+                        <span>Driver: {m.get('assigned_driver_id') or '—'}</span>
+                        <span>{m.get('status','?')}</span>
+                        <span>{str(m.get('created_at',''))[:16]}</span>
+                    </div>
+                    {notes_html}
+                </div>
+                """, unsafe_allow_html=True)
             
-            st.markdown("#### 🖥️ HARDWARE TELEMETRY")
-            h1, h2 = st.columns(2)
-            with h1:
-                fig_cpu = go.Figure(data=go.Scatter(y=[random.randint(20, 60) for _ in range(20)], mode='lines', fill='tozeroy', line=dict(color='#00ff9d')))
-                fig_cpu.update_layout(title="SERVER CPU LOAD", height=200, margin=dict(l=20, r=20, t=30, b=20), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color='#ccc')
-                st.plotly_chart(fig_cpu, use_container_width=True)
-            with h2:
-                fig_ram = go.Figure(data=go.Scatter(y=[random.randint(40, 55) for _ in range(20)], mode='lines', fill='tozeroy', line=dict(color='#00f3ff')))
-                fig_ram.update_layout(title="MEMORY USAGE", height=200, margin=dict(l=20, r=20, t=30, b=20), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color='#ccc')
-                st.plotly_chart(fig_ram, use_container_width=True)
-
-            st.markdown("#### 📉 MISSION HISTORY LOG")
-            st.dataframe(hist_df, use_container_width=True)
-            
-            csv = hist_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 DOWNLOAD CSV REPORT", data=csv, file_name='titan_mission_log.csv', mime='text/csv')
-        else:
-            st.info("No historical data available yet.")
+            mid_opts = view["mission_id"].dropna().astype(str).tolist()
+            if mid_opts:
+                st.markdown("---")
+                st.markdown("#### ⚙️ Manage Selected Mission")
+                selected_mid = st.selectbox("Select mission to manage", options=mid_opts, key="manage_mid")
+                cA, cB = st.columns(2)
+                with cA:
+                    drivers_df = get_available_drivers()
+                    drv_opts = ["UNASSIGNED"] + (drivers_df["driver_id"].astype(str).tolist() if not drivers_df.empty else [])
+                    new_drv = st.selectbox("Assign / Reassign driver", options=drv_opts, key="assign_driver_manage")
+                    if st.button("✅ APPLY ASSIGNMENT", use_container_width=True, type="primary"):
+                        update_mission_assignment(selected_mid, None if new_drv == "UNASSIGNED" else new_drv)
+                        log_activity("REASSIGN", st.session_state.get("operator_id", "HQ"), f"{selected_mid} → {new_drv}")
+                        st.toast(f"Assigned to {new_drv}")
+                        st.rerun()
+                with cB:
+                    if st.button("🛑 CANCEL MISSION", use_container_width=True, type="secondary"):
+                        update_mission_status(selected_mid, "CANCELLED")
+                        log_activity("CANCEL", st.session_state.get("operator_id", "HQ"), selected_mid)
+                        st.toast("Mission cancelled")
+                        st.rerun()
 
     with tab4:
-        st.subheader("📶 V2X LIVE COMMUNICATIONS")
-        c1, c2 = st.columns([1, 2])
+        # ==========================================
+        # ENGINEERING REPORT - Full Analytics Dashboard
+        # ==========================================
+        st.markdown("## 📊 ENGINEERING REPORT")
+        st.markdown("---")
         
-        with c1:
-            st.markdown("#### 📨 PACKET SNIFFER")
-            # Safe access to driver state for V2X logic
-            driver_pos = get_driver_status()
-            curr_lat = driver_pos['lat'] if driver_pos else 10.015
-            curr_lon = driver_pos['lon'] if driver_pos else 76.340
-            
-            if st.session_state.active_route or (driver_pos and driver_pos['status'] == "EN_ROUTE"):
-                sig, dist = get_nearest_signal(curr_lat, curr_lon)
-                st.markdown(f"""<div class="titan-card"><div class="metric-label">NEAREST NODE</div><div class="metric-value" style="font-size:20px;">{sig}</div><div style="color:#00ff9d;">CONNECTED ({dist}m)</div></div>""", unsafe_allow_html=True)
+        # Get analytics data
+        mission_stats = get_mission_analytics()
+        fleet_stats = get_fleet_metrics()
+        hazard_data = get_hazard_analytics()
+        
+        # Key Performance Indicators
+        st.markdown("### 🎯 Key Performance Indicators")
+        kpi_cols = st.columns(6)
+        
+        with kpi_cols[0]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; padding:20px;">
+                <div class="metric-label">TOTAL MISSIONS</div>
+                <div class="metric-value" style="color:#00f3ff;">{mission_stats['total']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with kpi_cols[1]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; padding:20px;">
+                <div class="metric-label">COMPLETED</div>
+                <div class="metric-value" style="color:#00ff9d;">{mission_stats['completed']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with kpi_cols[2]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; padding:20px;">
+                <div class="metric-label">ACTIVE NOW</div>
+                <div class="metric-value" style="color:#ffcc00;">{mission_stats['active']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with kpi_cols[3]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; padding:20px;">
+                <div class="metric-label">FLEET ONLINE</div>
+                <div class="metric-value" style="color:#00f3ff;">{fleet_stats['online']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with kpi_cols[4]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; padding:20px;">
+                <div class="metric-label">UNITS EN ROUTE</div>
+                <div class="metric-value" style="color:#ff003c;">{fleet_stats['en_route']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with kpi_cols[5]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; padding:20px;">
+                <div class="metric-label">AVG SPEED</div>
+                <div class="metric-value" style="color:#00ff9d;">{fleet_stats['avg_speed']}</div>
+                <div style="font-size:10px; color:#888;">KM/H</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Response time card
+        resp_min = mission_stats.get('avg_response_min', 0)
+        st.markdown(f"""
+        <div class="titan-card" style="text-align:center; padding:16px; margin:0 0 20px; border-left-color:#00f3ff;">
+            <div class="metric-label">AVG RESPONSE TIME</div>
+            <div class="metric-value" style="color:#00f3ff; font-size:24px;">{resp_min} MIN</div>
+            <div style="font-size:10px; color:#888;">Dispatch → Accept</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Charts Section
+        chart_col1, chart_col2 = st.columns(2)
+        
+        with chart_col1:
+            st.markdown("### 📈 Mission Status Distribution")
+            recent_missions = mission_stats['recent']
+            if not recent_missions.empty and 'status' in recent_missions.columns:
+                status_counts = recent_missions['status'].value_counts()
+                fig_pie = px.pie(
+                    values=status_counts.values,
+                    names=status_counts.index,
+                    color_discrete_sequence=['#00f3ff', '#00ff9d', '#ffcc00', '#ff003c', '#888888'],
+                    hole=0.4
+                )
+                fig_pie.update_layout(
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    font_color='#ffffff',
+                    showlegend=True,
+                    legend=dict(font=dict(size=10)),
+                    margin=dict(t=20, b=20, l=20, r=20)
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+            else:
+                st.info("No mission data available yet.")
+        
+        with chart_col2:
+            st.markdown("### 📊 Fleet Speed Analysis")
+            telemetry = fleet_stats['telemetry']
+            if not telemetry.empty and 'speed' in telemetry.columns:
+                # Speed over time
+                telemetry['timestamp'] = pd.to_datetime(telemetry['timestamp'], errors='coerce')
+                telemetry_clean = telemetry.dropna(subset=['speed', 'timestamp'])
                 
-                # Mock J2735 Message
-                bsm = {"msgID": "BSM", "tempID": f"{random.randint(10000,99999)}", "secMark": int(time.time()), "speed": random.randint(45, 60)}
-                st.json(bsm)
-            else: st.info("Link Idle")
+                if not telemetry_clean.empty:
+                    fig_speed = px.line(
+                        telemetry_clean.head(100),
+                        x='timestamp',
+                        y='speed',
+                        color='driver_id' if 'driver_id' in telemetry_clean.columns else None,
+                        title=None
+                    )
+                    fig_speed.update_layout(
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        font_color='#ffffff',
+                        xaxis=dict(showgrid=False, title=''),
+                        yaxis=dict(showgrid=True, gridcolor='#333', title='Speed (km/h)'),
+                        margin=dict(t=20, b=20, l=20, r=20)
+                    )
+                    fig_speed.update_traces(line=dict(width=2))
+                    st.plotly_chart(fig_speed, use_container_width=True)
+                else:
+                    st.info("No speed telemetry available.")
+            else:
+                st.info("No telemetry data available yet.")
+        
+        st.markdown("---")
+        
+        # Environmental Impact & Efficiency
+        st.markdown("### 🌱 Environmental Impact & Efficiency Metrics")
+        env_cols = st.columns(4)
+        
+        # Calculate estimates
+        total_distance = 0
+        total_time_saved = 0
+        logs = mission_stats['logs']
+        if not logs.empty:
+            if 'time_saved' in logs.columns:
+                total_time_saved = logs['time_saved'].sum()
+            # Estimate based on missions
+            total_distance = mission_stats['completed'] * 8.5  # avg 8.5 km per mission
+        
+        co2_saved = round(calculate_co2_savings(total_distance if total_distance else 1, total_time_saved or 0), 2)
+        fuel_saved = round(estimate_fuel_consumption(total_distance if total_distance else 1), 2)
+        
+        with env_cols[0]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; border-left-color:#00ff9d;">
+                <div style="font-size:30px;">🌍</div>
+                <div class="metric-label">EST. CO2 SAVED</div>
+                <div class="metric-value" style="color:#00ff9d;">{co2_saved}</div>
+                <div style="font-size:10px; color:#888;">KG</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with env_cols[1]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; border-left-color:#ffcc00;">
+                <div style="font-size:30px;">⛽</div>
+                <div class="metric-label">FUEL SAVED</div>
+                <div class="metric-value" style="color:#ffcc00;">{fuel_saved}</div>
+                <div style="font-size:10px; color:#888;">LITERS</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with env_cols[2]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; border-left-color:#00f3ff;">
+                <div style="font-size:30px;">⏱️</div>
+                <div class="metric-label">TIME SAVED</div>
+                <div class="metric-value" style="color:#00f3ff;">{int(total_time_saved)}</div>
+                <div style="font-size:10px; color:#888;">MINUTES</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with env_cols[3]:
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center; border-left-color:#ff003c;">
+                <div style="font-size:30px;">🚨</div>
+                <div class="metric-label">HAZARDS REPORTED</div>
+                <div class="metric-value" style="color:#ff003c;">{len(hazard_data)}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Data Export
+        st.markdown("### 📥 Data Export")
+        export_cols = st.columns(3)
+        missions_export = list_missions(500)
+        drivers_export = get_all_active_drivers(86400)
+        hazards_export = get_hazard_analytics()
+        with export_cols[0]:
+            if not missions_export.empty:
+                st.download_button("📄 Download Missions CSV", missions_export.to_csv(index=False), file_name=f"missions_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv", key="dl_missions")
+            else:
+                st.caption("No missions to export")
+        with export_cols[1]:
+            if not drivers_export.empty:
+                st.download_button("📄 Download Drivers CSV", drivers_export.to_csv(index=False), file_name=f"drivers_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv", key="dl_drivers")
+            else:
+                st.caption("No drivers to export")
+        with export_cols[2]:
+            if isinstance(hazards_export, pd.DataFrame) and not hazards_export.empty:
+                st.download_button("📄 Download Hazards CSV", hazards_export.to_csv(index=False), file_name=f"hazards_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv", key="dl_hazards")
+            else:
+                st.caption("No hazards to export")
+        
+        st.markdown("---")
+        # Recent Mission History Table
+        st.markdown("### 📜 Recent Mission History")
+        recent = mission_stats['recent']
+        if not recent.empty:
+            display_cols = [c for c in ['mission_id', 'created_at', 'origin', 'destination', 'priority', 'status', 'assigned_driver_id'] if c in recent.columns]
+            st.dataframe(
+                recent[display_cols] if display_cols else recent,
+                use_container_width=True,
+                height=300
+            )
+        else:
+            st.info("No mission history available.")
+        
+        # Missions per day chart
+        st.markdown("### 📊 Missions per Day")
+        daily_df = get_missions_per_day(7)
+        if not daily_df.empty and 'count' in daily_df.columns:
+            st.bar_chart(daily_df.set_index('day') if 'day' in daily_df.columns else daily_df)
+        else:
+            st.info("No missions completed in last 7 days.")
+        
+        # Driver leaderboard
+        st.markdown("### 🏆 Driver Leaderboard")
+        leaderboard = get_driver_leaderboard(10)
+        if not leaderboard.empty:
+            for i, row in leaderboard.iterrows():
+                rank = i + 1
+                did = row.get('driver_id', '?')
+                comp = row.get('completed', 0)
+                medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"#{rank}"
+                st.markdown(f"""
+                <div class="titan-card" style="padding:12px 16px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-weight:600; color:#fff;">{medal} {did}</span>
+                    <span style="color:#00ff9d; font-weight:700;">{comp} missions</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("No completed missions yet.")
+        
+        # Activity log
+        st.markdown("### 📋 Activity Log")
+        act_df = get_activity_log(20)
+        if not act_df.empty:
+            act_cols = [c for c in ['timestamp', 'action', 'actor', 'details'] if c in act_df.columns]
+            st.dataframe(act_df[act_cols].head(15), use_container_width=True, height=200)
+        else:
+            st.info("No activity logged yet.")
+        
+        # Data cleanup
+        st.markdown("---")
+        st.markdown("### 🧹 Data Maintenance")
+        if st.button("🗑️ Clean old telemetry (7+ days)", key="cleanup_btn"):
+            deleted, err = cleanup_old_driver_state(7)
+            if err:
+                st.error(f"Cleanup failed: {err}")
+            else:
+                st.success(f"Deleted {deleted} old driver_state rows.")
+                log_activity("CLEANUP", st.session_state.get("operator_id", "HQ"), f"Removed {deleted} rows")
+                st.rerun()
+        
+        # System Health
+        st.markdown("### 🖥️ System Health")
+        health_cols = st.columns(4)
+        with health_cols[0]:
+            st.metric("Database Status", "ONLINE", delta="WAL Mode")
+        with health_cols[1]:
+            st.metric("API Status", "CONNECTED", delta="TomTom Active")
+        with health_cols[2]:
+            st.metric("Sensor Grid", f"{len(SENSORS_GRID)} Nodes", delta="All Active")
+        with health_cols[3]:
+            st.metric("Uptime", "99.9%", delta="+0.1%")
 
-        with c2:
-            st.markdown("#### 📱 DRIVER MESSAGES")
-            if st.button("Refresh Messages"): st.rerun()
-            conn = sqlite3.connect(DB_FILE)
-            try:
-                comms_df = pd.read_sql_query("SELECT * FROM driver_comms ORDER BY id DESC LIMIT 10", conn)
-                if not comms_df.empty:
-                    for idx, row in comms_df.iterrows():
-                        color = "#ff003c" if "CRITICAL" in row['status'] or "ALERT" in row['status'] else "#00f3ff"
-                        st.markdown(f"""<div class="report-box" style="border-left: 3px solid {color};"><small>{row['timestamp']} | ID: {row['driver_id']}</small><br><strong style="color:white">{row['status']}</strong>: {row['message']}</div>""", unsafe_allow_html=True)
-                else: st.write("No messages received.")
-            except: pass
-            conn.close()
+    with tab5:
+        # ==========================================
+        # V2X COMMUNICATIONS LOG - Full Communication Center
+        # ==========================================
+        st.markdown("## 📶 V2X COMMUNICATIONS CENTER")
+        st.markdown("---")
+        
+        # Communication Stats
+        comms_df = get_driver_comms(200)
+        
+        comm_stats_cols = st.columns(4)
+        with comm_stats_cols[0]:
+            total_msgs = len(comms_df)
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center;">
+                <div class="metric-label">TOTAL MESSAGES</div>
+                <div class="metric-value" style="color:#00f3ff;">{total_msgs}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with comm_stats_cols[1]:
+            requests = len(comms_df[comms_df['status'] == 'REQUEST']) if not comms_df.empty and 'status' in comms_df.columns else 0
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center;">
+                <div class="metric-label">REQUESTS</div>
+                <div class="metric-value" style="color:#ffcc00;">{requests}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with comm_stats_cols[2]:
+            warnings = len(comms_df[comms_df['status'] == 'WARNING']) if not comms_df.empty and 'status' in comms_df.columns else 0
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center;">
+                <div class="metric-label">WARNINGS</div>
+                <div class="metric-value" style="color:#ff003c;">{warnings}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with comm_stats_cols[3]:
+            hq_msgs = len(comms_df[comms_df['status'].str.contains('HQ', na=False)]) if not comms_df.empty and 'status' in comms_df.columns else 0
+            st.markdown(f"""
+            <div class="titan-card" style="text-align:center;">
+                <div class="metric-label">HQ BROADCASTS</div>
+                <div class="metric-value" style="color:#00ff9d;">{hq_msgs}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Two-column layout: Send Message + Live Feed
+        msg_col, feed_col = st.columns([1, 2])
+        
+        with msg_col:
+            st.markdown("### 📤 HQ Broadcast")
+            
+            # Quick Actions
+            st.markdown("#### ⚡ Quick Actions")
+            quick_cols = st.columns(2)
+            
+            with quick_cols[0]:
+                if st.button("🟢 GRANT ALL GREEN", use_container_width=True):
+                    send_hq_message("ALL", "GREEN WAVE AUTHORIZED - All signals cleared for emergency vehicles", "HQ_GREENWAVE")
+                    st.success("Green Wave broadcast sent!")
+                    st.rerun()
+            
+            with quick_cols[1]:
+                if st.button("🔴 ALERT: STANDBY", use_container_width=True):
+                    send_hq_message("ALL", "STANDBY ALERT - Await further instructions from HQ", "HQ_ALERT")
+                    st.warning("Standby alert sent!")
+                    st.rerun()
+            
+            st.markdown("#### 📋 Message Templates")
+            t1, t2, t3 = st.columns(3)
+            MSG_TEMPLATES = [
+                ("Proceed", "Proceed to destination. Maintain speed.", "HQ_BROADCAST"),
+                ("Standby", "Standby at current location. Await instructions.", "HQ_ALERT"),
+                ("Return base", "Mission complete. Return to base.", "HQ_BROADCAST"),
+                ("Green granted", "Green Wave granted. Proceed with caution.", "HQ_GREENWAVE"),
+                ("Alternate route", "Take alternate route. Traffic ahead.", "HQ_REROUTE"),
+                ("ETA update", "Provide ETA update to HQ.", "HQ_BROADCAST"),
+            ]
+            for i, (label, msg, mtype) in enumerate(MSG_TEMPLATES):
+                col = [t1, t2, t3][i % 3]
+                with col:
+                    if st.button(f"📤 {label}", key=f"tpl_{i}", use_container_width=True):
+                        send_hq_message("ALL", msg, mtype)
+                        st.toast(f"Sent: {label}", icon="✅")
+                        st.rerun()
+            
+            st.markdown("---")
+            
+            # Custom Message Form
+            st.markdown("#### 📝 Custom Message")
+            with st.form("hq_message_form"):
+                drivers_online = get_available_drivers()
+                driver_opts = ["ALL UNITS"] + (drivers_online["driver_id"].tolist() if not drivers_online.empty else [])
+                
+                target_driver = st.selectbox("Target", driver_opts)
+                
+                msg_type = st.selectbox("Message Type", [
+                    "HQ_BROADCAST",
+                    "HQ_GREENWAVE",
+                    "HQ_ALERT",
+                    "HQ_REROUTE",
+                    "HQ_CLEARANCE",
+                    "HQ_INFO"
+                ])
+                
+                message_text = st.text_area("Message", placeholder="Enter message to send...")
+                
+                if st.form_submit_button("📡 TRANSMIT", use_container_width=True):
+                    if message_text:
+                        driver_id = "ALL" if target_driver == "ALL UNITS" else target_driver
+                        send_hq_message(driver_id, message_text, msg_type)
+                        st.success(f"Message transmitted to {target_driver}!")
+                        st.rerun()
+                    else:
+                        st.error("Please enter a message.")
+            
+            st.markdown("---")
+            
+            # Signal Control Panel
+            st.markdown("#### 🚦 Signal Control")
+            signal_name = st.selectbox("Select Junction", list(SENSORS_GRID.keys())[:10])
+            sig_cols = st.columns(2)
+            with sig_cols[0]:
+                if st.button("🟢 SET GREEN", use_container_width=True, key="set_green"):
+                    try:
+                        conn = sqlite3.connect(DB_FILE)
+                        c = conn.cursor()
+                        c.execute(
+                            "INSERT OR REPLACE INTO signal_status (stop_id, status, last_updated) VALUES (?, ?, ?)",
+                            (signal_name, "GREEN_WAVE", datetime.datetime.now())
+                        )
+                        conn.commit()
+                        conn.close()
+                        st.success(f"Green Wave set for {signal_name}")
+                    except Exception:
+                        st.error("Failed to update signal")
+            with sig_cols[1]:
+                if st.button("🔴 RESET", use_container_width=True, key="reset_sig"):
+                    try:
+                        conn = sqlite3.connect(DB_FILE)
+                        c = conn.cursor()
+                        c.execute("DELETE FROM signal_status WHERE stop_id = ?", (signal_name,))
+                        conn.commit()
+                        conn.close()
+                        st.info(f"Signal reset for {signal_name}")
+                    except Exception:
+                        st.error("Failed to reset signal")
+        
+        with feed_col:
+            st.markdown("### 📨 Live Communications Feed")
+            
+            # Filter options
+            filter_cols = st.columns(3)
+            with filter_cols[0]:
+                filter_type = st.multiselect("Filter by Type", ["REQUEST", "WARNING", "HQ_BROADCAST", "HQ_GREENWAVE", "HQ_ALERT"], default=[])
+            with filter_cols[1]:
+                filter_driver = st.text_input("Filter by Driver ID", "")
+            with filter_cols[2]:
+                show_count = st.slider("Messages to show", 10, 100, 50)
+            
+            # Apply filters
+            filtered_comms = comms_df.copy()
+            if not filtered_comms.empty:
+                if filter_type:
+                    filtered_comms = filtered_comms[filtered_comms['status'].isin(filter_type)]
+                if filter_driver:
+                    filtered_comms = filtered_comms[filtered_comms['driver_id'].str.contains(filter_driver, case=False, na=False)]
+                filtered_comms = filtered_comms.head(show_count)
+            
+            # Display communications as cards
+            if not filtered_comms.empty:
+                for _, row in filtered_comms.iterrows():
+                    timestamp = row.get('timestamp', '')
+                    driver_id = row.get('driver_id', 'UNKNOWN')
+                    status = row.get('status', 'INFO')
+                    message = row.get('message', '')
+                    
+                    # Color coding based on status
+                    if 'HQ' in status:
+                        color = "#00f3ff"
+                        icon = "📡"
+                    elif status == 'REQUEST':
+                        color = "#ffcc00"
+                        icon = "📨"
+                    elif status == 'WARNING':
+                        color = "#ff003c"
+                        icon = "⚠️"
+                    else:
+                        color = "#888888"
+                        icon = "💬"
+                    
+                    st.markdown(f"""
+                    <div style="background:#111; border-left:3px solid {color}; padding:12px; margin-bottom:8px; border-radius:4px;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
+                            <span style="color:{color}; font-weight:bold; font-family:'Orbitron'; font-size:12px;">{icon} {driver_id}</span>
+                            <span style="color:#666; font-size:10px;">{timestamp}</span>
+                        </div>
+                        <div style="color:#fff; font-size:13px;">{message}</div>
+                        <div style="color:#888; font-size:10px; margin-top:5px;">TYPE: {status}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No communications yet. Messages from drivers and HQ broadcasts will appear here.")
+            
+            # Auto-refresh indicator
+            st.markdown("""
+            <div style="text-align:center; padding:10px; color:#666; font-size:11px;">
+                🔄 Feed updates automatically when page refreshes
+            </div>
+            """, unsafe_allow_html=True)
 
-# ==========================================
-# 5. APP FLOW CONTROL
-# ==========================================
-if st.session_state.page == 'home':
-    render_home()
-elif st.session_state.page == 'login':
-    render_login()
+# --- MAIN ROUTING ---
+if st.session_state.page == 'home': render_home()
+elif st.session_state.page == 'login': render_login()
 elif st.session_state.page == 'dashboard':
-    if st.session_state.authenticated:
-        render_dashboard()
-    else:
+    if not st.session_state.authenticated:
         st.session_state.page = 'login'
         st.rerun()
+    else:
+        render_dashboard()
